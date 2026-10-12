@@ -21,15 +21,17 @@ Il binario finisce in `target/release/` (oppure nella cartella indicata da `CARG
 ```
 spotilite --help      # elenco dei comandi
 spotilite --version   # nome e versione
-spotilite login       # accesso all'account (non ancora implementato)
+spotilite login       # accesso all'account: apre il browser (--print-url stampa solo l'indirizzo)
+spotilite auth status # dice se c'è un token salvato e quando scade, senza mostrarlo
 spotilite play        # riproduzione (non ancora implementato)
 spotilite gui         # interfaccia grafica (non ancora implementato)
 ```
 
 ## Stato del progetto
 
-Fase **F0** (fondamenta): esiste solo lo scheletro della riga di comando.
-Accesso, riproduzione e interfaccia grafica arrivano nelle fasi successive.
+Fase **F1** (dipendenze e accesso): `spotilite login` usa OAuth con PKCE e salva il token
+in `%APPDATA%\spotilite\token.json` su Windows, `~/.local/state/spotilite/token.json` su Linux.
+Riproduzione e interfaccia grafica arrivano nelle fasi successive.
 L'architettura prevista è descritta in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Nota
