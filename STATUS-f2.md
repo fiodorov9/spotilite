@@ -8,7 +8,7 @@ Brief: `D:\spotilite\briefs\f2-riproduzione.md`. Ramo: `claude/f2`. Worktree: `D
 | F2-2 macchina a stati (GREEN) | FATTO | `cargo test --test state`: 22 passed; `cargo test`: 45 passed; clippy pulito |
 | F2-3 player e audio su librespot | FATTO | `cargo test`: 56 passed; dispositivo reale di questa macchina aperto con il backend di librespot; `docs/PLAYER.md` 28 righe |
 | F2-4 comando `play` | FATTO | `cargo test`: 63 passed; `play spotify:track:xxx` senza token: «esegui prima `spotilite login`», exit 1 |
-| F2-5 verifica e rapporto | IN CORSO | |
+| F2-5 verifica e rapporto | FATTO | build release ok (4m 11s, 7,9 MB); `cargo test`: 63 passed; `--help` elenca login, play, gui, auth |
 
 ## Log
 
@@ -45,3 +45,20 @@ Brief: `D:\spotilite\briefs\f2-riproduzione.md`. Ramo: `claude/f2`. Worktree: `D
   - token scaduto -> `errore: il token di accesso è scaduto: esegui di nuovo `spotilite login``, exit 1;
   - URI di playlist -> messaggio «è una playlist: per ora si possono riprodurre solo brani ... ed episodi ...», exit 1.
 - F2-4, `README.md`: riga di `play` e stato del progetto aggiornati.
+- F2-4, verifiche sul ciclo di `play` nel sorgente di librespot 0.8: l'evento `Stopped` nasce solo dal comando `Stop` (nel CLI solo con Ctrl+C, dopo il quale si esce), gli errori di caricamento o di stream arrivano come `Unavailable` (gestito); con `Bitrate320` librespot ripiega in ordine su MP3 320/256, OGG 160, MP3 160, OGG 96, MP3 96 se manca il file a 320.
+- F2-5, `cargo build --release` -> `Finished release profile [optimized] target(s) in 4m 11s`, exit 0, nessun warning (log `D:\spotilite\build\f2-release.log`); `spotilite.exe` release pesa 7,9 MB (in F0 erano 631 KB: la differenza è librespot con TLS, decodifica e backend audio).
+- F2-5, `cargo test` -> lib 11, main 2, auth 11, cli 2, login 9, play 6, state 22, doc-test 0: **63 passed, 0 failed**, exit 0.
+- F2-5, `spotilite.exe --help` (release) -> elenca `login`, `play` («Play Spotify tracks or episodes, in order»), `gui`, `auth`, `help`; exit 0. `--version` -> `spotilite 0.1.0`.
+- F2-5, binario release con stato vuoto (`APPDATA=D:\spotilite\build\f2-release-check`): `play spotify:track:xxx` -> `errore: nessun token salvato: esegui prima `spotilite login``, exit 1.
+- Fine fase: `C:\Users\Admin\AppData\Roaming\spotilite` non esiste; nessun file scritto fuori da `D:\spotilite` (a parte la cache standard di `CARGO_HOME`, come in F0 e F1). Il token finto delle prove a mano è stato cancellato. `Cargo.toml`, `src/auth.rs`, `src/config.rs` non toccati; `src/ui/` non esiste. Nessuna `RICHIESTE-f2.md`: non è mancato nulla.
+- **Non provato**: la riproduzione reale. Serve un account Premium e un utente davanti al dispositivo: la riproduzione reale va provata dall'utente sul proprio desktop (`spotilite login`, poi `spotilite play spotify:track:4uLU6hMCjMI75M1A2tKUQC`). Non provati quindi: suono, passaggio al brano successivo a fine brano, posizione durante l'ascolto, volume udibile, Ctrl+C durante la riproduzione, messaggio per i brani non disponibili. Non provabile qui il ramo «nessun dispositivo audio» (questa macchina ne ha uno): coperto dagli unit test. Non compilati i rami Linux (installato solo il target `x86_64-pc-windows-msvc`), anche se `audio.rs` e `player.rs` non hanno codice specifico per Windows.
+
+## Note per le fasi successive
+
+- **Rinnovo del token**: il token di accesso dura un'ora e `auth.rs` (di F1) non ha una funzione di refresh, anche se salva il `refresh_token`. Dopo un'ora `play` chiede di rifare il login. Va aggiunto in `auth` da chi ne è responsabile; `Player::connect` riceve già un `&Token`, quindi basterà passargli quello rinnovato.
+- Album e playlist: da espandere in brani con i metadati (`librespot::metadata::Album`/`Playlist`) prima di accodarli; oggi `play` li rifiuta con un messaggio chiaro.
+- Il CLI non precarica il brano successivo (librespot manda `TimeToPreloadNextTrack`, ignorato): tra un brano e l'altro può esserci una breve pausa. `Player` potrà esporre un `preload`.
+- `audio.rs` installa una volta un panic hook che tace solo sul thread che apre il dispositivo e altrimenti chiama quello precedente: se la GUI installa un proprio hook dopo, il messaggio di un eventuale panico del backend tornerà su stderr (l'errore resta comunque un `AudioError`).
+- Firme per la GUI in `docs/PLAYER.md`.
+
+FASE-COMPLETA
