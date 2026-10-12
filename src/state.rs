@@ -48,66 +48,125 @@ pub type CommandResult = Result<PlaybackEffect, StateError>;
 
 /// The queue with a cursor on the current track, the playback status and the volume.
 #[derive(Debug, Clone)]
-pub struct PlaybackState {}
+pub struct PlaybackState {
+    queue: Vec<String>,
+    /// The current track. When stopped it is the track `play()` starts, and it equals
+    /// `queue.len()` once the queue has been played to the end.
+    cursor: usize,
+    status: Status,
+    volume: u8,
+}
 
 impl PlaybackState {
     /// Stopped, with an empty queue and the volume at [`DEFAULT_VOLUME`].
     pub fn new() -> Self {
-        todo!("F2-2")
+        Self {
+            queue: Vec::new(),
+            cursor: 0,
+            status: Status::Stopped,
+            volume: DEFAULT_VOLUME,
+        }
     }
 
     pub fn status(&self) -> Status {
-        todo!("F2-2")
+        self.status
     }
 
     pub fn queue(&self) -> &[String] {
-        todo!("F2-2")
+        &self.queue
     }
 
     /// Position in the queue of the current track.
     pub fn current_index(&self) -> Option<usize> {
-        todo!("F2-2")
+        (self.cursor < self.queue.len()).then_some(self.cursor)
     }
 
     /// The track playing, paused, or that `play()` would start after `stop()`.
     pub fn current(&self) -> Option<&str> {
-        todo!("F2-2")
+        self.queue.get(self.cursor).map(String::as_str)
     }
 
     pub fn volume(&self) -> u8 {
-        todo!("F2-2")
+        self.volume
     }
 
     /// Appends `uri` to the queue and, when stopped, starts playing.
-    pub fn enqueue(&mut self, _uri: impl Into<String>) -> CommandResult {
-        todo!("F2-2")
+    pub fn enqueue(&mut self, uri: impl Into<String>) -> CommandResult {
+        let uri = uri.into();
+        let uri = uri.trim();
+        if uri.is_empty() {
+            return Err(StateError::EmptyUri);
+        }
+        self.queue.push(uri.to_string());
+        if self.status == Status::Stopped {
+            // The cursor is on the first track of a new queue, on the added track
+            // once the queue has ended, or on the track left by `stop()`.
+            self.start(self.cursor)
+        } else {
+            Ok(PlaybackEffect::None)
+        }
     }
 
     pub fn play(&mut self) -> CommandResult {
-        todo!("F2-2")
+        match self.status {
+            Status::Playing => Ok(PlaybackEffect::None),
+            Status::Paused => {
+                self.status = Status::Playing;
+                Ok(PlaybackEffect::Resume)
+            }
+            // Once the queue has ended, it starts again from the top.
+            Status::Stopped => self.start(self.current_index().unwrap_or(0)),
+        }
     }
 
     pub fn pause(&mut self) -> CommandResult {
-        todo!("F2-2")
+        if self.status != Status::Playing {
+            return Ok(PlaybackEffect::None);
+        }
+        self.status = Status::Paused;
+        Ok(PlaybackEffect::Pause)
     }
 
     pub fn stop(&mut self) -> CommandResult {
-        todo!("F2-2")
+        if self.status == Status::Stopped {
+            return Ok(PlaybackEffect::None);
+        }
+        self.status = Status::Stopped;
+        Ok(PlaybackEffect::Stop)
     }
 
     /// Skips to the next track; after the last one, stops.
+    #[expect(clippy::should_implement_trait, reason = "a player command, not an iterator")]
     pub fn next(&mut self) -> CommandResult {
-        todo!("F2-2")
+        if self.queue.is_empty() {
+            return Err(StateError::EmptyQueue);
+        }
+        let next = self.cursor + 1;
+        if next < self.queue.len() {
+            return self.start(next);
+        }
+        self.cursor = self.queue.len();
+        self.stop()
     }
 
     /// Goes back one track; on the first one, restarts it.
     pub fn prev(&mut self) -> CommandResult {
-        todo!("F2-2")
+        // From the end of the queue this is the last track.
+        self.start(self.cursor.saturating_sub(1))
     }
 
     /// Sets the volume, cut to [`MAX_VOLUME`].
-    pub fn set_volume(&mut self, _volume: u8) -> CommandResult {
-        todo!("F2-2")
+    pub fn set_volume(&mut self, volume: u8) -> CommandResult {
+        self.volume = volume.min(MAX_VOLUME);
+        Ok(PlaybackEffect::SetVolume(self.volume))
+    }
+
+    /// Moves the cursor to `index` and plays that track from the beginning.
+    fn start(&mut self, index: usize) -> CommandResult {
+        let uri = self.queue.get(index).ok_or(StateError::EmptyQueue)?.clone();
+        self.cursor = index;
+        self.status = Status::Playing;
+        Ok(PlaybackEffect::StartTrack(uri))
     }
 }
 

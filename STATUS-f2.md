@@ -5,8 +5,8 @@ Brief: `D:\spotilite\briefs\f2-riproduzione.md`. Ramo: `claude/f2`. Worktree: `D
 | Task | Stato | Nota |
 |------|-------|------|
 | F2-1 test macchina a stati (RED) | FATTO | `cargo test --test state`: 0 passed, 22 failed (`not yet implemented`), exit 101 |
-| F2-2 macchina a stati (GREEN) | IN CORSO | |
-| F2-3 player e audio su librespot | DA FARE | |
+| F2-2 macchina a stati (GREEN) | FATTO | `cargo test --test state`: 22 passed; `cargo test`: 45 passed; clippy pulito |
+| F2-3 player e audio su librespot | IN CORSO | |
 | F2-4 comando `play` | DA FARE | |
 | F2-5 verifica e rapporto | DA FARE | |
 
@@ -23,3 +23,5 @@ Brief: `D:\spotilite\briefs\f2-riproduzione.md`. Ramo: `claude/f2`. Worktree: `D
   - volume `u8` tagliato a 100 (`set_volume(150)` e `set_volume(255)` danno 100), volume iniziale 100 (nessuna attenuazione: comanda il volume di sistema);
   - in più `stop()`: tiene il brano corrente, e `play()` lo fa ripartire da capo.
 - F2-1, RED: `cargo test --test state` -> `test result: FAILED. 0 passed; 22 failed`, exit 101, tutti con `not yet implemented: F2-2`. Nessun warning di compilazione.
+- F2-2: `PlaybackState` tiene `queue`, `cursor`, `status`, `volume`. Ogni comando restituisce `Result<PlaybackEffect, StateError>` con `PlaybackEffect` = `None`, `StartTrack(uri)`, `Resume`, `Pause`, `Stop`, `SetVolume(u8)`. Un solo punto (`start`) sposta il cursore e accede alla coda, con `get` e non con l'indice: nessun panico possibile. URI salvati senza spazi iniziali e finali.
+- F2-2, verifica: `cargo test --test state` -> `test result: ok. 22 passed; 0 failed`; `cargo test` (tutta la suite) -> main 1, auth 11, cli 2, login 9, state 22: **45 passed, 0 failed**. `cargo clippy --all-targets`: un solo avviso, `should_implement_trait` su `next()` (il nome lo impone il brief e lo stato non è un iteratore): soppresso con `#[expect(..., reason = ...)]`, poi exit 0 senza warning.
