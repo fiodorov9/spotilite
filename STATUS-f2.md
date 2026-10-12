@@ -7,8 +7,8 @@ Brief: `D:\spotilite\briefs\f2-riproduzione.md`. Ramo: `claude/f2`. Worktree: `D
 | F2-1 test macchina a stati (RED) | FATTO | `cargo test --test state`: 0 passed, 22 failed (`not yet implemented`), exit 101 |
 | F2-2 macchina a stati (GREEN) | FATTO | `cargo test --test state`: 22 passed; `cargo test`: 45 passed; clippy pulito |
 | F2-3 player e audio su librespot | FATTO | `cargo test`: 56 passed; dispositivo reale di questa macchina aperto con il backend di librespot; `docs/PLAYER.md` 28 righe |
-| F2-4 comando `play` | IN CORSO | |
-| F2-5 verifica e rapporto | DA FARE | |
+| F2-4 comando `play` | FATTO | `cargo test`: 63 passed; `play spotify:track:xxx` senza token: «esegui prima `spotilite login`», exit 1 |
+| F2-5 verifica e rapporto | IN CORSO | |
 
 ## Log
 
@@ -35,3 +35,13 @@ Brief: `D:\spotilite\briefs\f2-riproduzione.md`. Ramo: `claude/f2`. Worktree: `D
 - F2-3, **prova reale su questa macchina** (esempio temporaneo, poi cancellato): `AudioOutput::system_default()` -> backend `rodio`, dispositivo `Altoparlanti (Realtek(R) Audio)`; il costruttore del sink chiamato su un thread separato apre il dispositivo e `start()` riesce: `apertura: Ok(Ok(()))`. Il ramo «nessun dispositivo» non è provabile qui (il dispositivo c'è): è coperto dagli unit test.
 - F2-3, documentazione: `docs/PLAYER.md` (28 righe) con le firme esatte per F3; in `docs/ARCHITECTURE.md` aggiornati i moduli presenti e la direzione `cli`/`ui` -> `state` -> esito -> `player`.
 - F2-3, verifica: `cargo clippy --all-targets` exit 0 senza warning; `cargo test` -> lib 11, main 1, auth 11, cli 2, login 9, state 22: **56 passed, 0 failed**.
+- F2-4, `spotilite play <URI>...` (uno o più URI, più `--volume 0..100`, default 100): 1) carica il token, se manca `bail!` «nessun token salvato: esegui prima `spotilite login`» (stderr con il prefisso `errore:`, exit 1); 2) controlla tutti gli URI senza rete né audio (così `spotify:track:xxx` senza token dà il messaggio del login, come chiede il brief, e un URI sbagliato non contatta nulla); 3) `Player::connect` (token scaduto, poi dispositivo audio, poi rete); 4) volume e `enqueue` passano dalla macchina a stati e il loro esito va a `player.apply`; 5) ciclo sugli eventi: `TrackInfo` stampa «In riproduzione: titolo (artisti, m:ss)», `EndOfTrack` -> `state.next()`, `Unavailable` -> avviso e `state.next()`; finisce quando la macchina a stati torna `Stopped` («Fine della coda.», exit 0). Ctrl+C -> `state.stop()`, «Riproduzione interrotta.», exit 0. Se nessun brano era disponibile: errore, exit 1.
+- F2-4, help di `play` cambiato da «Play a track, album or playlist» a «Play Spotify tracks or episodes, in order»: album e playlist richiedono di leggere i metadati per espanderli in brani, e non fanno parte di questa fase; ora vengono rifiutati con un messaggio chiaro («... è una playlist: per ora si possono riprodurre solo brani ... ed episodi ...»).
+- F2-4, test: nuovo `tests/play.rs`, 6 test end-to-end sul binario, tutti fermi prima di audio e rete, con `APPDATA` reindirizzato: senza token (con `spotify:track:xxx`, il caso del brief), token scaduto (senza mostrare il token), URI non valido (e niente «Collegamento» su stdout), album rifiutato, nessun URI (exit 2 di clap), `--volume 150` (exit 2). Più 1 unit test per la riga «In riproduzione».
+- F2-4, verifica: `cargo test` -> lib 11, main 2, auth 11, cli 2, login 9, play 6, state 22: **63 passed, 0 failed**; `cargo clippy --all-targets` exit 0 senza warning.
+- F2-4, prove a mano (con `APPDATA=D:\spotilite\build\f2-manual`; prima delle prove `C:\Users\Admin\AppData\Roaming\spotilite` non esisteva):
+  - `spotilite play spotify:track:xxx` senza token -> `errore: nessun token salvato: esegui prima `spotilite login``, exit 1;
+  - token **finto ma non scaduto** e URI valido, contro i **veri** server di Spotify -> `Collegamento a Spotify...` poi `errore: Spotify ha rifiutato l'accesso (Login failed with reason: Bad credentials): esegui di nuovo `spotilite login` con un account Premium`, exit 1, in 0,4 s. Conferma su questa macchina: controllo del dispositivo audio superato, risoluzione dell'access point e handshake di librespot riusciti, errore di autenticazione reso leggibile, nessun panico;
+  - token scaduto -> `errore: il token di accesso è scaduto: esegui di nuovo `spotilite login``, exit 1;
+  - URI di playlist -> messaggio «è una playlist: per ora si possono riprodurre solo brani ... ed episodi ...», exit 1.
+- F2-4, `README.md`: riga di `play` e stato del progetto aggiornati.
