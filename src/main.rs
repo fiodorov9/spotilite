@@ -4,10 +4,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use spotilite::auth::{self, AuthError, PendingLogin, TokenStore};
 use spotilite::config;
+use spotilite::player::{self, PlaybackEvent, Player};
+use spotilite::state::{self, PlaybackState, Status};
 
 /// Local port that receives the redirect from Spotify after sign-in.
 const DEFAULT_LOGIN_PORT: u16 = 5588;
@@ -24,8 +26,8 @@ struct Cli {
 enum Command {
     /// Sign in with a Spotify Premium account
     Login(LoginArgs),
-    /// Play a track, album or playlist
-    Play,
+    /// Play Spotify tracks or episodes, in order
+    Play(PlayArgs),
     /// Open the graphical interface
     Gui,
     /// Inspect the saved sign-in
@@ -54,6 +56,17 @@ struct LoginArgs {
     token_endpoint: String,
 }
 
+#[derive(Args)]
+struct PlayArgs {
+    /// Spotify URIs of tracks or episodes, such as spotify:track:4uLU6hMCjMI75M1A2tKUQC
+    #[arg(required = true, value_name = "URI")]
+    uris: Vec<String>,
+    /// Volume from 0 to 100
+    #[arg(long, default_value_t = state::DEFAULT_VOLUME,
+          value_parser = clap::value_parser!(u8).range(0..=i64::from(state::MAX_VOLUME)))]
+    volume: u8,
+}
+
 #[derive(Subcommand)]
 enum AuthCommand {
     /// Show whether a token is saved and when it expires
@@ -68,7 +81,7 @@ async fn main() -> ExitCode {
         Some(Command::Auth {
             command: AuthCommand::Status,
         }) => auth_status(),
-        Some(Command::Play) => not_yet_implemented("play"),
+        Some(Command::Play(args)) => play(args).await,
         Some(Command::Gui) => not_yet_implemented("gui"),
         None => Cli::command()
             .print_help()
@@ -144,6 +157,83 @@ fn auth_status() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Plays the URIs in order through the state machine, until the queue ends or Ctrl+C.
+async fn play(args: PlayArgs) -> Result<ExitCode> {
+    let store = TokenStore::new(config::state_dir()?);
+    let Some(token) = store.load()? else {
+        bail!("nessun token salvato: esegui prima `spotilite login`");
+    };
+    // A typo is reported before touching the audio device or the network.
+    for uri in &args.uris {
+        player::check_uri(uri)?;
+    }
+
+    let mut out = io::stdout();
+    writeln!(out, "Collegamento a Spotify...")?;
+    out.flush()?;
+    let mut player = Player::connect(&token).await?;
+    writeln!(out, "Collegato come {}.", player.username())?;
+
+    let mut state = PlaybackState::new();
+    player.apply(&state.set_volume(args.volume)?)?;
+    for uri in &args.uris {
+        player.apply(&state.enqueue(uri.as_str())?)?;
+    }
+
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut ctrl_c_done = false;
+    let mut unavailable = 0;
+    while state.status() != Status::Stopped {
+        let event = tokio::select! {
+            event = player.next_event() => event,
+            pressed = &mut ctrl_c, if !ctrl_c_done => {
+                ctrl_c_done = true;
+                if pressed.is_err() {
+                    // No Ctrl+C handler: playback simply runs to the end of the queue.
+                    continue;
+                }
+                player.apply(&state.stop()?)?;
+                writeln!(out, "Riproduzione interrotta.")?;
+                return Ok(ExitCode::SUCCESS);
+            }
+        };
+        match event {
+            None => bail!("il motore di riproduzione si è fermato"),
+            Some(PlaybackEvent::Loading { uri }) => writeln!(out, "Caricamento di {uri}...")?,
+            Some(PlaybackEvent::TrackInfo {
+                title,
+                artists,
+                duration,
+                ..
+            }) => writeln!(out, "In riproduzione: {}", describe_track(&title, &artists, duration))?,
+            Some(PlaybackEvent::EndOfTrack { .. }) => player.apply(&state.next()?)?,
+            Some(PlaybackEvent::Unavailable { uri }) => {
+                unavailable += 1;
+                writeln!(io::stderr(), "attenzione: {uri} non è disponibile, passo al successivo")?;
+                player.apply(&state.next()?)?;
+            }
+            Some(_) => {}
+        }
+    }
+    if unavailable == args.uris.len() {
+        bail!("nessuno dei brani richiesti è disponibile");
+    }
+    writeln!(out, "Fine della coda.")?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `Title (Artist, Other artist, 3:07)`.
+fn describe_track(title: &str, artists: &[String], duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let length = format!("{}:{:02}", seconds / 60, seconds % 60);
+    if artists.is_empty() {
+        format!("{title} ({length})")
+    } else {
+        format!("{title} ({}, {length})", artists.join(", "))
+    }
+}
+
 fn not_yet_implemented(command: &str) -> Result<ExitCode> {
     writeln!(io::stdout(), "{command}: non ancora implementato")?;
     Ok(ExitCode::SUCCESS)
@@ -176,7 +266,19 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::format_utc;
+    use std::time::Duration;
+
+    use super::{describe_track, format_utc};
+
+    #[test]
+    fn describe_track_lists_artists_and_length() {
+        let artists = ["Rick Astley".to_string(), "Altro".to_string()];
+        assert_eq!(
+            describe_track("Never Gonna Give You Up", &artists, Duration::from_millis(213_573)),
+            "Never Gonna Give You Up (Rick Astley, Altro, 3:33)"
+        );
+        assert_eq!(describe_track("Senza autore", &[], Duration::from_secs(65)), "Senza autore (1:05)");
+    }
 
     #[test]
     fn format_utc_matches_known_dates() {

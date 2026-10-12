@@ -1,8 +1,9 @@
 # Architettura di spotilite
 
 Riferimento per le fasi dopo F0. Descrive i moduli previsti e le regole che li legano.
-Oggi il codice contiene la riga di comando (`src/main.rs`) e i moduli `config` e `auth`
-(`src/lib.rs`, usati anche dai test).
+Oggi il codice contiene la riga di comando (`src/main.rs`) e i moduli `config`, `auth`,
+`state`, `player` e `audio` (`src/lib.rs`, usati anche dai test). L'interfaccia di
+riproduzione è descritta in [PLAYER.md](PLAYER.md).
 
 ## Moduli previsti
 
@@ -19,8 +20,10 @@ Oggi il codice contiene la riga di comando (`src/main.rs`) e i moduli `config` e
 
 Direzione delle dipendenze (mai al contrario):
 
-- `cli` e `ui` sono i punti d'ingresso: leggono `state` e inviano comandi a `player`.
-- `player` usa `spotify` per i metadati e `audio` per il suono, e aggiorna `state`.
+- `cli` e `ui` sono i punti d'ingresso: danno i comandi a `state`, che decide, e passano
+  a `player` l'esito (`PlaybackEffect`); gli eventi di `player` tornano a `state` tramite loro.
+- `state` è logica pura: non dipende da nessun altro modulo, così si prova senza rete né audio.
+- `player` usa `spotify` per i metadati e `audio` per il suono.
 - `spotify` usa `auth` per la sessione; `auth` usa `config`.
 - `config` non dipende da nessun altro modulo del progetto.
 

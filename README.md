@@ -23,7 +23,7 @@ spotilite --help      # elenco dei comandi
 spotilite --version   # nome e versione
 spotilite login       # accesso all'account: apre il browser (--print-url stampa solo l'indirizzo)
 spotilite auth status # dice se c'è un token salvato e quando scade, senza mostrarlo
-spotilite play        # riproduzione (non ancora implementato)
+spotilite play <uri>  # riproduce in ordine brani o episodi (spotify:track:...), Ctrl+C per fermare
 spotilite gui         # interfaccia grafica (non ancora implementato)
 ```
 
@@ -31,7 +31,9 @@ spotilite gui         # interfaccia grafica (non ancora implementato)
 
 Fase **F1** (dipendenze e accesso): `spotilite login` usa OAuth con PKCE e salva il token
 in `%APPDATA%\spotilite\token.json` su Windows, `~/.local/state/spotilite/token.json` su Linux.
-Riproduzione e interfaccia grafica arrivano nelle fasi successive.
+Fase **F2** (riproduzione): `spotilite play` suona brani ed episodi con librespot, sul dispositivo
+audio predefinito; album e playlist non sono ancora supportati.
+L'interfaccia grafica arriva nella fase successiva.
 L'architettura prevista è descritta in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Nota
