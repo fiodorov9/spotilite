@@ -145,7 +145,7 @@ fn pkce_challenge_matches_the_rfc_7636_example() {
     // Test vector from RFC 7636, Appendix B.
     let challenge = auth::pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
 
-    assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK52-QSjxE4fNBVqKAo");
+    assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
 }
 
 #[test]
