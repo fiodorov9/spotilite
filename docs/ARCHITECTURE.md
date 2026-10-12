@@ -1,7 +1,8 @@
 # Architettura di spotilite
 
 Riferimento per le fasi dopo F0. Descrive i moduli previsti e le regole che li legano.
-Oggi il codice contiene solo lo scheletro della riga di comando (`src/main.rs`).
+Oggi il codice contiene la riga di comando (`src/main.rs`) e i moduli `config` e `auth`
+(`src/lib.rs`, usati anche dai test).
 
 ## Moduli previsti
 
@@ -42,8 +43,7 @@ librespot si usa solo attraverso la sua API pubblica, senza copiarne il codice.
 librespot resta confinato nei moduli `auth`, `spotify`, `player` e `audio`, dietro tipi
 e interfacce di spotilite, così il resto dell'app non dipende direttamente dai suoi tipi.
 
-Non è ancora tra le dipendenze: lo aggiungono le fasi successive, insieme alle librerie
-per l'interfaccia grafica e l'uscita audio.
+È tra le dipendenze dalla fase F1, insieme a `rodio` per l'uscita audio.
 
 ## Obiettivi trasversali
 
