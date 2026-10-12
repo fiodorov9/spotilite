@@ -5,8 +5,8 @@ Brief: `D:\spotilite\briefs\f1-login.md`. Ramo: `claude/f1`. Worktree: `D:\spoti
 | Task | Stato | Nota |
 |------|-------|------|
 | F1-1 dipendenze | FATTO | `cargo build` exit 0; `reqwest` in più rispetto al brief; `vergen` bloccato a 9.0.6 in `Cargo.lock` |
-| F1-2 test auth (RED) | IN CORSO | |
-| F1-3 config e auth (GREEN) | DA FARE | |
+| F1-2 test auth (RED) | FATTO | `cargo test --test auth`: errore di compilazione, exit 101 |
+| F1-3 config e auth (GREEN) | IN CORSO | |
 | F1-4 comando login | DA FARE | |
 
 ## Log
@@ -17,3 +17,4 @@ Brief: `D:\spotilite\briefs\f1-login.md`. Ramo: `claude/f1`. Worktree: `D:\spoti
 - F1-1, dipendenza **in più rispetto all'elenco del brief: `reqwest` 0.12** (`default-features = false`, `native-tls`). Serve a F1-4 per lo scambio codice -> token (POST a `accounts.spotify.com/api/token`): nessuna crate dell'elenco fa richieste HTTP, e l'`OAuthClient` di `librespot-oauth` genera da sé PKCE e URL, quindi non può usare `authorize_url`/`parse_callback` come chiede il brief. `reqwest` 0.12 con `native-tls` è già nell'albero (lo usa `librespot-oauth`), quindi costo di compilazione nullo. Va deciso adesso perché `Cargo.toml` si tocca una volta sola.
 - F1-1, prima `cargo build`: **fallita** (exit 101 dopo 185 s, log `D:\spotilite\build\f1-build1.log`) nello script di build di `librespot-core` 0.8.0: `the trait bound vergen::feature::build::Build: vergen_lib::entries::Add is not satisfied`. Causa: `vergen-gitcl` 1.0.8 chiede `vergen ^9.0.6` e `vergen-lib ^0.1.6`, ma il resolver ha scelto `vergen` 9.1.0, che usa `vergen-lib` 9.1.0 (rottura di semver in una minor). Non è un problema della macchina. Correzione: `cargo update -p vergen --precise 9.0.6`, che tocca **solo `Cargo.lock`** (versionato), non `Cargo.toml`.
 - F1-1, seconda `cargo build`: `Finished dev profile [unoptimized + debuginfo] target(s) in 1m 18s`, exit 0, nessun warning (log `D:\spotilite\build\f1-build2.log`). Tempo totale della prima compilazione di librespot: circa 4,5 minuti (185 s + 78 s). `cargo tree -d`: i duplicati presenti (`base64` 0.23, `rand` 0.8, `thiserror` 1, `getrandom` 0.2/0.3/0.4, ...) vengono dalle dipendenze transitive di librespot; le versioni scelte qui coincidono con quelle usate direttamente da librespot.
+- F1-2: `tests/auth.rs` con 11 test: i 5 del brief, più il salvataggio che sostituisce il token senza lasciare file temporanei, il file danneggiato che dà un errore con il nome del file, il callback senza codice, il vettore di prova di RFC 7636 (appendice B) per la challenge S256 e il verifier casuale ben formato. `parse_callback` restituisce una struct con `code` e `state` (serve a F1-4 per il controllo CSRF). Il test di `state_dir()` reindirizza `APPDATA` (Linux: `XDG_STATE_HOME`) in `CARGO_TARGET_TMPDIR`, così nessun test scrive nel profilo reale fuori da `D:\spotilite`. RED: `cargo test --test auth` -> `error[E0432]: unresolved import spotilite` (il crate non ha ancora una libreria), exit 101.
