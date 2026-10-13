@@ -10,6 +10,7 @@ use spotilite::auth::{self, AuthError, PendingLogin, TokenStore};
 use spotilite::config;
 use spotilite::player::{self, PlayRequest, PlaybackEvent, Player};
 use spotilite::state::{self, PlaybackState, Status};
+use spotilite::ui;
 
 /// Local port that receives the redirect from Spotify after sign-in.
 const DEFAULT_LOGIN_PORT: u16 = 5588;
@@ -29,7 +30,7 @@ enum Command {
     /// Play Spotify tracks, episodes or whole albums, in order
     Play(PlayArgs),
     /// Open the graphical interface
-    Gui,
+    Gui(GuiArgs),
     /// Inspect the saved sign-in
     Auth {
         #[command(subcommand)]
@@ -77,6 +78,17 @@ struct PlayArgs {
     proxy: Option<String>,
 }
 
+#[derive(Args)]
+struct GuiArgs {
+    /// OAuth client ID used at sign-in, needed to renew the token [default: the one librespot uses]
+    #[arg(long)]
+    client_id: Option<String>,
+    /// Draws this many frames without connecting to Spotify, then closes: for automatic checks
+    #[arg(long, hide = true, value_name = "FRAMES", num_args = 0..=1, default_missing_value = "5",
+          value_parser = clap::value_parser!(u32).range(1..))]
+    selftest: Option<u32>,
+}
+
 #[derive(Subcommand)]
 enum AuthCommand {
     /// Show whether a token is saved and when it expires
@@ -92,7 +104,7 @@ async fn main() -> ExitCode {
             command: AuthCommand::Status,
         }) => auth_status(),
         Some(Command::Play(args)) => play(args).await,
-        Some(Command::Gui) => not_yet_implemented("gui"),
+        Some(Command::Gui(args)) => gui(args),
         None => Cli::command()
             .print_help()
             .map(|()| ExitCode::SUCCESS)
@@ -290,8 +302,16 @@ fn default_client_id() -> String {
     librespot::core::SessionConfig::default().client_id
 }
 
-fn not_yet_implemented(command: &str) -> Result<ExitCode> {
-    writeln!(io::stdout(), "{command}: non ancora implementato")?;
+/// Opens the window; the engine thread in `spotilite::ui` does the playing.
+fn gui(args: GuiArgs) -> Result<ExitCode> {
+    let connector = ui::engine::SpotifyConnector {
+        client_id: args.client_id.unwrap_or_else(default_client_id),
+        token_endpoint: auth::TOKEN_ENDPOINT.to_string(),
+    };
+    ui::run(ui::GuiOptions {
+        connector,
+        selftest: args.selftest,
+    })?;
     Ok(ExitCode::SUCCESS)
 }
 
