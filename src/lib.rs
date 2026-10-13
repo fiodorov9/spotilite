@@ -6,3 +6,4 @@ pub mod config;
 mod library;
 pub mod player;
 pub mod state;
+pub mod ui;
