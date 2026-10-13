@@ -65,6 +65,15 @@ struct PlayArgs {
     #[arg(long, default_value_t = state::DEFAULT_VOLUME,
           value_parser = clap::value_parser!(u8).range(0..=i64::from(state::MAX_VOLUME)))]
     volume: u8,
+    /// OAuth client ID used at sign-in, needed to renew the token [default: the one librespot uses]
+    #[arg(long)]
+    client_id: Option<String>,
+    /// Token endpoint, replaced by the tests with a local fake
+    #[arg(long, hide = true, default_value = auth::TOKEN_ENDPOINT)]
+    token_endpoint: String,
+    /// HTTP proxy for the Spotify session, pointed by the tests at a local fake
+    #[arg(long, hide = true)]
+    proxy: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -96,9 +105,7 @@ async fn main() -> ExitCode {
 
 async fn login(args: LoginArgs) -> Result<ExitCode> {
     let store = TokenStore::new(config::state_dir()?);
-    let client_id = args
-        .client_id
-        .unwrap_or_else(|| librespot::core::SessionConfig::default().client_id);
+    let client_id = args.client_id.unwrap_or_else(default_client_id);
     let pending = PendingLogin::start(&client_id, args.port, &args.token_endpoint)?;
 
     let mut out = io::stdout();
@@ -167,11 +174,13 @@ async fn play(args: PlayArgs) -> Result<ExitCode> {
     for uri in &args.uris {
         player::check_uri(uri)?;
     }
+    let client_id = args.client_id.unwrap_or_else(default_client_id);
+    let token = auth::fresh_token(&store, token, &args.token_endpoint, &client_id).await?;
 
     let mut out = io::stdout();
     writeln!(out, "Collegamento a Spotify...")?;
     out.flush()?;
-    let mut player = Player::connect(&token).await?;
+    let mut player = Player::connect_via(&token, args.proxy.as_deref()).await?;
     writeln!(out, "Collegato come {}.", player.username())?;
 
     let mut state = PlaybackState::new();
@@ -232,6 +241,11 @@ fn describe_track(title: &str, artists: &[String], duration: Duration) -> String
     } else {
         format!("{title} ({}, {length})", artists.join(", "))
     }
+}
+
+/// The client ID librespot signs in with, used when `--client-id` is not given.
+fn default_client_id() -> String {
+    librespot::core::SessionConfig::default().client_id
 }
 
 fn not_yet_implemented(command: &str) -> Result<ExitCode> {

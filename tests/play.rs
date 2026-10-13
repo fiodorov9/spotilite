@@ -57,10 +57,18 @@ fn play_without_a_token_asks_to_sign_in_first() {
     assert_failed_cleanly(status, &stderr, "esegui prima `spotilite login`");
 }
 
+/// An expired token is renewed with its refresh token (see `tests/refresh.rs`); without
+/// one there is nothing to renew it with.
 #[test]
-fn play_with_an_expired_token_asks_to_sign_in_again() {
+fn play_with_an_expired_token_that_cannot_be_renewed_asks_to_sign_in_again() {
     let base = scratch_dir("expired");
-    save_token(&base, 1_000_000);
+    let token = Token {
+        access_token: "at-secret".to_string(),
+        refresh_token: String::new(),
+        expires_at: 1_000_000,
+        scopes: vec!["streaming".to_string()],
+    };
+    TokenStore::new(base.join("spotilite")).save(&token).expect("save the token");
     let (status, _, stderr) = play(&base, &[TRACK]);
     assert_failed_cleanly(status, &stderr, "scaduto");
     assert!(stderr.contains("spotilite login"), "stderr must say what to do, got: {stderr}");

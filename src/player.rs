@@ -18,6 +18,7 @@ use librespot::playback::config::{Bitrate, PlayerConfig};
 use librespot::playback::mixer::softmixer::SoftMixer;
 use librespot::playback::mixer::{Mixer, MixerConfig};
 use librespot::playback::player::{Player as Engine, PlayerEvent as EngineEvent, PlayerEventChannel};
+use reqwest::Url;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -81,15 +82,33 @@ impl Player {
     /// default audio device. The device is checked before going to the network, so a
     /// computer without one fails fast, with an error and not a panic.
     pub async fn connect(token: &Token) -> Result<Self, PlayerError> {
+        Self::connect_via(token, None).await
+    }
+
+    /// Like [`Player::connect`], with the Spotify session going through `proxy`, the
+    /// address of an HTTP proxy, when there is one.
+    pub async fn connect_via(token: &Token, proxy: Option<&str>) -> Result<Self, PlayerError> {
         if token.is_expired_at(auth::unix_now()) {
             return Err(PlayerError::TokenExpired);
         }
+        let proxy = proxy
+            .map(|proxy| {
+                Url::parse(proxy)
+                    .map_err(|err| PlayerError::Connect(format!("indirizzo del proxy non valido ({proxy}): {err}")))
+            })
+            .transpose()?;
         // Listing the devices may block, so it runs off the async threads.
         let output = tokio::task::spawn_blocking(AudioOutput::system_default)
             .await
             .map_err(internal)??;
 
-        let session = Session::new(SessionConfig::default(), None);
+        let session = Session::new(
+            SessionConfig {
+                proxy,
+                ..SessionConfig::default()
+            },
+            None,
+        );
         session
             .connect(Credentials::with_access_token(token.access_token.as_str()), false)
             .await

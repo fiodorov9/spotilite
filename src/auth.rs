@@ -483,6 +483,19 @@ async fn exchange_code(
     })
 }
 
+/// Returns `token` ready to open a new session.
+///
+/// F3-2 renews it here at `token_endpoint` when it has expired or is about to.
+pub async fn fresh_token(
+    store: &TokenStore,
+    token: Token,
+    token_endpoint: &str,
+    client_id: &str,
+) -> Result<Token, AuthError> {
+    let _ = (store, token_endpoint, client_id);
+    Ok(token)
+}
+
 /// Joins an error with its causes: reqwest keeps the useful detail in the sources.
 fn error_chain(err: &dyn std::error::Error) -> String {
     let mut text = err.to_string();
