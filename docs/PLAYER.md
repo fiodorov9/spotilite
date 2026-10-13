@@ -36,3 +36,5 @@ Quattro moduli della libreria `spotilite`; i tipi di librespot non escono da `pl
 4. La barra di avanzamento legge `player.position()`, che avanza da sola mentre il brano suona.
 
 Note: gli eventi di un `load` superato vengono scartati; `Player` è `Send`; i comandi non bloccano, il `Drop` ferma la riproduzione e attende il thread di librespot.
+
+La GUI (F4) segue lo stesso ciclo nel thread del motore (`ui/engine.rs`), attraverso il trait `ui::engine::Backend`, che `Player` implementa con le funzioni qui sopra; vedi [ARCHITECTURE.md](ARCHITECTURE.md), «Interfaccia grafica».
