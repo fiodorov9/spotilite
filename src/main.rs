@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use spotilite::auth::{self, AuthError, PendingLogin, TokenStore};
 use spotilite::config;
-use spotilite::player::{self, PlaybackEvent, Player};
+use spotilite::player::{self, PlayRequest, PlaybackEvent, Player};
 use spotilite::state::{self, PlaybackState, Status};
 
 /// Local port that receives the redirect from Spotify after sign-in.
@@ -26,7 +26,7 @@ struct Cli {
 enum Command {
     /// Sign in with a Spotify Premium account
     Login(LoginArgs),
-    /// Play Spotify tracks or episodes, in order
+    /// Play Spotify tracks, episodes or whole albums, in order
     Play(PlayArgs),
     /// Open the graphical interface
     Gui,
@@ -58,7 +58,8 @@ struct LoginArgs {
 
 #[derive(Args)]
 struct PlayArgs {
-    /// Spotify URIs of tracks or episodes, such as spotify:track:4uLU6hMCjMI75M1A2tKUQC
+    /// Spotify URIs of tracks, episodes or albums, such as spotify:track:4uLU6hMCjMI75M1A2tKUQC
+    /// or spotify:album:6akEvsycLGftJxYudPjmqK (playlists will come in a later version)
     #[arg(required = true, value_name = "URI")]
     uris: Vec<String>,
     /// Volume from 0 to 100
@@ -171,15 +172,18 @@ fn auth_status() -> Result<ExitCode> {
 }
 
 /// Plays the URIs in order through the state machine, until the queue ends or Ctrl+C.
+/// An album plays all its tracks, disc by disc.
 async fn play(args: PlayArgs) -> Result<ExitCode> {
     let store = TokenStore::new(config::state_dir()?);
     let Some(token) = store.load()? else {
         bail!("nessun token salvato: esegui prima `spotilite login`");
     };
     // A typo is reported before touching the audio device or the network.
-    for uri in &args.uris {
-        player::check_uri(uri)?;
-    }
+    let requests = args
+        .uris
+        .iter()
+        .map(|uri| player::parse_request(uri))
+        .collect::<Result<Vec<_>, _>>()?;
     let client_id = args.client_id.unwrap_or_else(default_client_id);
     let token = auth::fresh_token(&store, token, &args.token_endpoint, &client_id).await?;
 
@@ -189,9 +193,26 @@ async fn play(args: PlayArgs) -> Result<ExitCode> {
     let mut player = Player::connect_via(&token, args.proxy.as_deref()).await?;
     writeln!(out, "Collegato come {}.", player.username())?;
 
+    // Albums are read before playback starts, so the queue follows the arguments and an
+    // album that cannot be read stops everything before the first note.
+    let mut queue = Vec::new();
+    for request in requests {
+        match request {
+            PlayRequest::Item(uri) => queue.push(uri),
+            PlayRequest::Album(uri) => {
+                let tracks = player.album_tracks(&uri).await?;
+                writeln!(out, "album accodato: {}", count_tracks(tracks.len()))?;
+                queue.extend(tracks);
+            }
+        }
+    }
+    if queue.is_empty() {
+        bail!("nessun brano da riprodurre");
+    }
+
     let mut state = PlaybackState::new();
     player.apply(&state.set_volume(args.volume)?)?;
-    for uri in &args.uris {
+    for uri in &queue {
         player.apply(&state.enqueue(uri.as_str())?)?;
     }
 
@@ -237,11 +258,20 @@ async fn play(args: PlayArgs) -> Result<ExitCode> {
             Some(_) => {}
         }
     }
-    if unavailable == args.uris.len() {
+    if unavailable == queue.len() {
         bail!("nessuno dei brani richiesti è disponibile");
     }
     writeln!(out, "Fine della coda.")?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `1 brano`, `12 brani`.
+fn count_tracks(count: usize) -> String {
+    if count == 1 {
+        "1 brano".to_string()
+    } else {
+        format!("{count} brani")
+    }
 }
 
 /// `Title (Artist, Other artist, 3:07)`.
@@ -294,7 +324,14 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
 mod tests {
     use std::time::Duration;
 
-    use super::{describe_track, format_utc};
+    use super::{count_tracks, describe_track, format_utc};
+
+    #[test]
+    fn count_tracks_agrees_with_the_number() {
+        assert_eq!(count_tracks(0), "0 brani");
+        assert_eq!(count_tracks(1), "1 brano");
+        assert_eq!(count_tracks(12), "12 brani");
+    }
 
     #[test]
     fn describe_track_lists_artists_and_length() {

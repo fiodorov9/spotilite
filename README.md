@@ -23,7 +23,7 @@ spotilite --help      # elenco dei comandi
 spotilite --version   # nome e versione
 spotilite login       # accesso all'account: apre il browser (--print-url stampa solo l'indirizzo)
 spotilite auth status # dice se c'è un token salvato e quando scade, senza mostrarlo
-spotilite play <uri>  # riproduce in ordine brani o episodi (spotify:track:...), Ctrl+C per fermare
+spotilite play <uri>  # riproduce in ordine brani, episodi o album interi (spotify:track:..., spotify:album:...), Ctrl+C per fermare
 spotilite gui         # interfaccia grafica (non ancora implementato)
 ```
 
@@ -32,9 +32,13 @@ spotilite gui         # interfaccia grafica (non ancora implementato)
 Fase **F1** (dipendenze e accesso): `spotilite login` usa OAuth con PKCE e salva il token
 in `%APPDATA%\spotilite\token.json` su Windows, `~/.local/state/spotilite/token.json` su Linux.
 Fase **F2** (riproduzione): `spotilite play` suona brani ed episodi con librespot, sul dispositivo
-audio predefinito; album e playlist non sono ancora supportati.
-Fase **F3** (sessione continua): il token di accesso dura un'ora e `spotilite play` lo rinnova
+audio predefinito.
+Fase **F3** (sessione continua e album): il token di accesso dura un'ora e `spotilite play` lo rinnova
 da sé quando è scaduto o sta per scadere; `spotilite login` serve solo se Spotify revoca l'accesso.
+Negli ultimi 30 secondi di un brano si scarica in anticipo il successivo, per ridurre la pausa tra i due.
+`spotilite play spotify:album:...` accoda tutti i brani dell'album, disco per disco; i brani non
+disponibili si saltano con un avviso. Le playlist non sono ancora supportate: arriveranno in una
+fase successiva, e per ora `play` le rifiuta con un messaggio che lo dice.
 L'interfaccia grafica arriva nella fase successiva.
 L'architettura prevista è descritta in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 

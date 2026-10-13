@@ -85,11 +85,24 @@ fn play_rejects_an_invalid_uri_before_connecting() {
 }
 
 #[test]
-fn play_explains_that_albums_are_not_supported_yet() {
+fn play_explains_that_playlists_will_come_later() {
+    let base = scratch_dir("playlist");
+    save_token(&base, auth::unix_now() + 3600);
+    let (status, stdout, stderr) = play(&base, &["spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"]);
+    assert_failed_cleanly(status, &stderr, "è una playlist: le playlist arriveranno");
+    assert!(!stdout.contains("Collegamento"), "nothing must be contacted, stdout: {stdout}");
+}
+
+/// The album passes the check: the error is about the URI after it. Reading the album
+/// needs a Spotify session, so it is not tested here.
+#[test]
+fn play_accepts_an_album() {
     let base = scratch_dir("album");
     save_token(&base, auth::unix_now() + 3600);
-    let (status, _, stderr) = play(&base, &["spotify:album:6akEvsycLGftJxYudPjmqK"]);
-    assert_failed_cleanly(status, &stderr, "è un album");
+    let (status, stdout, stderr) = play(&base, &["spotify:album:6akEvsycLGftJxYudPjmqK", "spotify:track:xxx"]);
+    assert_failed_cleanly(status, &stderr, "indirizzo Spotify non valido: spotify:track:xxx");
+    assert!(!stderr.contains("6akEvsycLGftJxYudPjmqK"), "the album must be accepted, stderr: {stderr}");
+    assert!(!stdout.contains("Collegamento"), "nothing must be contacted, stdout: {stdout}");
 }
 
 #[test]

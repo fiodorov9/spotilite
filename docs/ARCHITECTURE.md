@@ -2,8 +2,10 @@
 
 Riferimento per le fasi dopo F0. Descrive i moduli previsti e le regole che li legano.
 Oggi il codice contiene la riga di comando (`src/main.rs`) e i moduli `config`, `auth`,
-`state`, `player` e `audio` (`src/lib.rs`, usati anche dai test). L'interfaccia di
-riproduzione è descritta in [PLAYER.md](PLAYER.md).
+`state`, `player` e `audio` (`src/lib.rs`, usati anche dai test), più `library`, interno alla
+libreria: è il primo pezzo del modulo `spotify` previsto qui sotto e per ora legge, con i
+metadati di librespot, i brani di un album per `player`. L'interfaccia di riproduzione è
+descritta in [PLAYER.md](PLAYER.md).
 
 ## Moduli previsti
 

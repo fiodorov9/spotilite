@@ -20,15 +20,17 @@ Quattro moduli della libreria `spotilite`; i tipi di librespot non escono da `pl
 - `preload(&self, uri: &str) -> Result<(), PlayerError>`: scarica in anticipo un brano o un episodio, così il `load` successivo dello stesso URI parte subito; non fa nulla se è già caricato o in precaricamento.
 - `async fn next_event(&mut self) -> Option<PlaybackEvent>`: `Loading`, `TrackInfo { title, artists, duration }`, `Playing { position }`, `Paused { position }`, `TimeToPreload` (il brano finisce tra circa 30 s ed è tutto scaricato), `EndOfTrack`, `Unavailable`, `Stopped`, tutti con `uri` (quello del brano a cui si riferiscono). `None`: il player di librespot si è fermato.
 - `track_to_preload<'a>(event: &PlaybackEvent, state: &'a PlaybackState) -> Option<&'a str>`: dopo `TimeToPreload` del brano corrente, il brano seguente della coda; `None` per gli altri eventi, per un annuncio su un altro brano, da fermo e sull'ultimo brano. Logica pura, senza rete.
-- `check_uri(uri: &str) -> Result<(), PlayerError>`: controllo senza rete; si riproducono solo `spotify:track:` e `spotify:episode:`.
-- `PlayerError`: `TokenExpired`, `Rejected`, `Connect`, `Audio(AudioError)`, `InvalidUri`, `NotPlayable`, `Internal`; messaggi in italiano.
+- `check_uri(uri: &str) -> Result<(), PlayerError>`: controllo senza rete di ciò che `load` e `preload` accettano: solo `spotify:track:` e `spotify:episode:`.
+- `parse_request(uri: &str) -> Result<PlayRequest, PlayerError>`: controllo senza rete di ciò che si può chiedere di ascoltare. `PlayRequest::Item(String)` (brano o episodio) o `PlayRequest::Album(String)`, con l'URI in forma canonica, la stessa degli eventi. Le playlist danno `PlaylistNotYet` («arriveranno in una prossima versione»), artisti e podcast `NotPlayable`.
+- `async fn album_tracks(&self, uri: &str) -> Result<Vec<String>, PlayerError>`: i brani dell'album in ordine d'ascolto (disco 1, poi disco 2, ...), letti dai metadati di Spotify, da accodare uno per uno con `state.enqueue`. Errore: `Album { uri, reason }`.
+- `PlayerError`: `TokenExpired`, `Rejected`, `Connect`, `Audio(AudioError)`, `InvalidUri`, `NotPlayable`, `PlaylistNotYet`, `AlbumNotLoadable` (album passato a `load`), `Album`, `Internal`; messaggi in italiano.
 
 ## `audio`: uscita audio
 - `AudioOutput::system_default() -> Result<AudioOutput, AudioError>`, poi `backend(&self) -> &str`, `device_name(&self) -> Option<&str>`. `Player::connect` la usa da sé.
 - `AudioError`: `NoDevice`, `NoBackend`, `Open(String)`. Senza dispositivo si ottiene un errore, mai un panico.
 
 ## Ciclo tipico
-1. `let effect = state.enqueue(uri)?; player.apply(&effect)?;` e lo stesso per play, pausa, next, prev, volume.
+1. `let effect = state.enqueue(uri)?; player.apply(&effect)?;` e lo stesso per play, pausa, next, prev, volume. Per un album: `for uri in player.album_tracks(&album).await? { player.apply(&state.enqueue(uri)?)?; }`.
 2. Su `PlaybackEvent::TimeToPreload`: `if let Some(next) = player::track_to_preload(&event, &state) { player.preload(next)?; }`, così il brano seguente parte senza pausa.
 3. Su `PlaybackEvent::EndOfTrack` o `Unavailable`: `player.apply(&state.next()?)?` (se il brano seguente è stato precaricato, librespot usa i dati già scaricati).
 4. La barra di avanzamento legge `player.position()`, che avanza da sola mentre il brano suona.

@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 
 use crate::audio::{AudioError, AudioOutput};
 use crate::auth::{self, Token};
+use crate::library;
 use crate::state::{DEFAULT_VOLUME, MAX_VOLUME, PlaybackEffect, PlaybackState, Status};
 
 /// How long librespot's player thread may take to open the audio device.
@@ -39,12 +40,37 @@ pub enum PlayerError {
     Connect(String),
     #[error(transparent)]
     Audio(#[from] AudioError),
-    #[error("indirizzo Spotify non valido: {0} (atteso spotify:track:<id di 22 caratteri>)")]
+    #[error(
+        "indirizzo Spotify non valido: {0} (atteso spotify:track:, spotify:episode: o spotify:album: \
+         seguito da un id di 22 caratteri)"
+    )]
     InvalidUri(String),
-    #[error("{uri} è {kind}: per ora si possono riprodurre solo brani (spotify:track:...) ed episodi (spotify:episode:...)")]
+    #[error(
+        "{uri} è {kind}: si possono riprodurre brani (spotify:track:...), episodi (spotify:episode:...) \
+         e album (spotify:album:...)"
+    )]
     NotPlayable { uri: String, kind: &'static str },
+    #[error(
+        "{0} è una playlist: le playlist arriveranno in una prossima versione; per ora si possono \
+         riprodurre brani, episodi e album"
+    )]
+    PlaylistNotYet(String),
+    #[error("{0} è un album: il player carica un brano alla volta, dall'elenco dei brani dell'album")]
+    AlbumNotLoadable(String),
+    #[error("impossibile leggere l'album {uri}: {reason}")]
+    Album { uri: String, reason: String },
     #[error("errore interno del player: {0}")]
     Internal(String),
+}
+
+/// What `spotilite play` can do with a URI, recognised without the network. The URIs
+/// are in canonical form, as librespot reports them in the events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayRequest {
+    /// A track or an episode, ready for [`Player::load`].
+    Item(String),
+    /// An album, to turn into its tracks with [`Player::album_tracks`].
+    Album(String),
 }
 
 /// What librespot reports about playback, in spotilite's terms.
@@ -170,6 +196,22 @@ impl Player {
         self.session.username()
     }
 
+    /// The tracks of an album in listening order (disc by disc), read from Spotify's
+    /// metadata, ready to be queued one by one.
+    pub async fn album_tracks(&self, uri: &str) -> Result<Vec<String>, PlayerError> {
+        let album_error = |reason: String| PlayerError::Album {
+            uri: uri.to_string(),
+            reason,
+        };
+        let parsed = parse_uri(uri)?;
+        if !matches!(parsed, SpotifyUri::Album { .. }) {
+            return Err(album_error("non è un album".to_string()));
+        }
+        library::album_tracks(&self.session, &parsed)
+            .await
+            .map_err(|err| album_error(err.to_string()))
+    }
+
     /// Loads a track or an episode and plays it from the beginning.
     pub fn load(&self, uri: &str) -> Result<(), PlayerError> {
         let uri = parse_playable(uri)?;
@@ -264,21 +306,45 @@ fn same_item(a: &str, b: &str) -> bool {
         )
 }
 
+/// Recognises what `spotilite play` can do with `uri`, without the network: tracks and
+/// episodes play as they are, albums are expanded into their tracks first.
+pub fn parse_request(uri: &str) -> Result<PlayRequest, PlayerError> {
+    let parsed = parse_uri(uri)?;
+    match parsed {
+        SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => Ok(PlayRequest::Item(parsed.to_string())),
+        SpotifyUri::Album { .. } => Ok(PlayRequest::Album(parsed.to_string())),
+        _ => Err(not_playable(uri, &parsed)),
+    }
+}
+
+/// A track or an episode, for [`Player::load`] and [`Player::preload`].
 fn parse_playable(uri: &str) -> Result<SpotifyUri, PlayerError> {
-    let parsed = SpotifyUri::from_uri(uri.trim()).map_err(|_| PlayerError::InvalidUri(uri.to_string()))?;
+    let parsed = parse_uri(uri)?;
+    match parsed {
+        SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => Ok(parsed),
+        _ => Err(not_playable(uri, &parsed)),
+    }
+}
+
+fn parse_uri(uri: &str) -> Result<SpotifyUri, PlayerError> {
+    SpotifyUri::from_uri(uri.trim()).map_err(|_| PlayerError::InvalidUri(uri.to_string()))
+}
+
+/// Why `uri`, which names `parsed`, cannot be loaded as it is. Tracks and episodes never
+/// get here.
+fn not_playable(uri: &str, parsed: &SpotifyUri) -> PlayerError {
     let kind = match parsed {
-        SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => return Ok(parsed),
-        SpotifyUri::Album { .. } => "un album",
+        SpotifyUri::Album { .. } => return PlayerError::AlbumNotLoadable(uri.to_string()),
+        SpotifyUri::Playlist { .. } => return PlayerError::PlaylistNotYet(uri.to_string()),
         SpotifyUri::Artist { .. } => "un artista",
-        SpotifyUri::Playlist { .. } => "una playlist",
         SpotifyUri::Show { .. } => "un podcast",
         SpotifyUri::Local { .. } => "un file locale",
-        SpotifyUri::Unknown { .. } => "un elemento di tipo sconosciuto",
+        _ => "un elemento di tipo sconosciuto",
     };
-    Err(PlayerError::NotPlayable {
+    PlayerError::NotPlayable {
         uri: uri.to_string(),
         kind,
-    })
+    }
 }
 
 /// librespot's mixers take a volume from 0 to 65535.
@@ -481,11 +547,39 @@ mod tests {
 
     #[test]
     fn other_uris_are_refused_with_a_reason() {
-        let album = check_uri("spotify:album:6akEvsycLGftJxYudPjmqK").unwrap_err();
-        assert!(matches!(album, PlayerError::NotPlayable { kind: "un album", .. }), "{album:?}");
+        let album = check_uri(ALBUM).unwrap_err();
+        assert!(matches!(album, PlayerError::AlbumNotLoadable(_)), "the player loads tracks: {album:?}");
+        let artist = check_uri("spotify:artist:0gxyHStUsqpMadRV0Di1Qt").unwrap_err();
+        assert!(matches!(artist, PlayerError::NotPlayable { kind: "un artista", .. }), "{artist:?}");
         for invalid in ["spotify:track:xxx", "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC", ""] {
             assert!(matches!(check_uri(invalid), Err(PlayerError::InvalidUri(_))), "{invalid}");
         }
+    }
+
+    const ALBUM: &str = "spotify:album:6akEvsycLGftJxYudPjmqK";
+
+    #[test]
+    fn play_accepts_tracks_episodes_and_albums_in_canonical_form() {
+        assert_eq!(parse_request(TRACK).unwrap(), PlayRequest::Item(TRACK.to_string()));
+        assert_eq!(parse_request(&format!(" {LAST} ")).unwrap(), PlayRequest::Item(LAST.to_string()));
+        assert_eq!(parse_request(ALBUM).unwrap(), PlayRequest::Album(ALBUM.to_string()));
+        assert_eq!(
+            parse_request("spotify:user:someone:track:4uLU6hMCjMI75M1A2tKUQC").unwrap(),
+            PlayRequest::Item(TRACK.to_string())
+        );
+    }
+
+    #[test]
+    fn playlists_are_refused_until_they_arrive() {
+        let playlist = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M";
+        let err = parse_request(playlist).unwrap_err();
+        assert!(matches!(err, PlayerError::PlaylistNotYet(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("è una playlist") && message.contains("arriveranno"), "{message}");
+
+        let show = parse_request("spotify:show:5CfCWKI5pZ28U0uOzXkDHe").unwrap_err();
+        assert!(matches!(show, PlayerError::NotPlayable { kind: "un podcast", .. }), "{show:?}");
+        assert!(matches!(parse_request("spotify:album:xxx"), Err(PlayerError::InvalidUri(_))));
     }
 
     #[test]
