@@ -8,7 +8,7 @@ Brief: `D:\spotilite\briefs\f3-sessione.md`. Ramo: `claude/f3`. Worktree: `D:\sp
 | F3-2 rinnovo in `auth.rs` (GREEN) | FATTO | `cargo test`: 73 passed (refresh 9/9); clippy pulito; rinnovo con refresh token finto contro l'endpoint reale: «sessione scaduta», exit 1, file intatto |
 | F3-3 precaricamento del brano successivo | FATTO | `cargo test`: 78 passed (5 unit test nuovi); clippy pulito; prova reale non possibile qui |
 | F3-4 play di un album intero | FATTO | `cargo test`: 88 passed (9 unit test nuovi, 2 test di `play` cambiati); clippy pulito; lettura reale dei metadati non provabile qui (nessun token Premium) |
-| F3-5 verifica e rapporto | IN CORSO | |
+| F3-5 verifica e rapporto | FATTO | `cargo test`: 88 passed; clippy pulito; build release ok (3m 50s, 8,55 MB); prove a mano con il binario release |
 
 ## Log
 
@@ -76,3 +76,26 @@ Brief: `D:\spotilite\briefs\f3-sessione.md`. Ramo: `claude/f3`. Worktree: `D:\sp
   - `play spotify:album:6akEvsycLGftJxYudPjmqK` contro i **veri** server -> `Collegamento a Spotify...` poi `errore: Spotify ha rifiutato l'accesso (Login failed with reason: Bad credentials): ...`, exit 1, in 0,36 s: l'album supera i controlli e si arriva alla sessione;
   - `--help` e `play --help` mostrano album e playlist «in a later version».
 - F3-4, **non provata**: la lettura vera dei metadati di un album (`Album::get`) e quindi il messaggio «album accodato: N brani» su un album reale. Serve una sessione autenticata, cioè un token valido di un account Premium: su questa macchina non c'è (`%APPDATA%\spotilite` non esiste) e con un token finto Spotify rifiuta l'accesso prima dei metadati.
+- F3-4, commit `5731df4`.
+- F3-5, `cargo test` -> lib 24, main 3, auth 12, cli 2, login 9, play 7, refresh 9, state 22, doc-test 0: **88 passed, 0 failed**, exit 0.
+- F3-5, `cargo clippy --all-targets` -> `Finished dev profile`, exit 0, 0 warning.
+- F3-5, `cargo build --release` -> `Finished release profile [optimized] target(s) in 3m 50s`, exit 0, 0 warning (log `D:\spotilite\build\f3-release.log`); `spotilite.exe` release pesa 8,55 MB (7,9 MB in F2).
+- F3-5, prove a mano con il binario release (`APPDATA=D:\spotilite\build\f3-release-check`):
+  - `--version` -> `spotilite 0.1.0`; `--help` -> `login`, `play` («Play Spotify tracks, episodes or whole albums, in order»), `gui`, `auth`, `help`, exit 0;
+  - stato vuoto, `play spotify:track:xxx` -> `errore: nessun token salvato: esegui prima `spotilite login``, exit 1;
+  - token finto scaduto con refresh token finto: `auth status` -> `scaduto il 1970-01-12 13:46 UTC: `spotilite play` lo rinnova da sé`, exit 0; `play spotify:album:6akEvsycLGftJxYudPjmqK` contro l'endpoint **reale** dei token -> `errore: sessione scaduta: esegui `spotilite login``, exit 1, nella cartella resta solo `token.json`;
+  - token finto non scaduto, stesso album, server **reali** -> `Collegamento a Spotify...` poi `errore: Spotify ha rifiutato l'accesso (Login failed with reason: Bad credentials): ...`, exit 1;
+  - playlist -> `errore: ... è una playlist: le playlist arriveranno in una prossima versione; per ora si possono riprodurre brani, episodi e album`, exit 1.
+- Fine fase: i token finti delle prove a mano sono stati cancellati; `C:\Users\Admin\AppData\Roaming\spotilite` non esiste; nessun file scritto fuori da `D:\spotilite` (a parte la cache standard di `CARGO_HOME`). `Cargo.toml`, `Cargo.lock`, `src/config.rs` invariati rispetto a `main`; `src/ui/` non esiste. Nessuna `RICHIESTE-f3.md`: non è mancato nulla.
+- **Non provato** (serve un account Premium e un utente davanti al dispositivo): la riproduzione reale va provata dall'utente sul proprio desktop. In particolare: rinnovo automatico con un refresh token vero (provati solo l'endpoint finto e il rifiuto dell'endpoint reale), precaricamento e passaggio senza pausa al brano successivo, lettura dei metadati di un album vero con «album accodato: N brani», salto dei brani non disponibili di un album. Comandi suggeriti: `spotilite login`, poi `spotilite play spotify:album:6akEvsycLGftJxYudPjmqK`, e dopo più di un'ora di nuovo `spotilite play ...` (deve ripartire senza chiedere il login). Non compilati i rami Linux (installato solo il target `x86_64-pc-windows-msvc`); il codice nuovo non ha parti specifiche per Windows.
+
+## Note per le fasi successive
+
+- **Client ID**: il file del token non salva il client ID usato all'accesso; `play` rinnova con `--client-id` o, in sua assenza, con quello di librespot (lo stesso predefinito di `login`). La GUI deve usare lo stesso client ID di `login`. Per salvarlo nel file servirebbe un campo in più in `Token`, che oggi i test costruiscono campo per campo.
+- **Rinnovo concorrente**: se GUI e CLI rinnovano nello stesso momento e Spotify cambia il refresh token a ogni rinnovo, una delle due può ricevere `invalid_grant` («sessione scaduta»). Rimedio semplice, non fatto perché oggi c'è un solo processo: su `invalid_grant` rileggere il file e usare il token se un altro processo lo ha già rinnovato.
+- Il token OAuth serve a librespot solo per aprire la sessione: dopo, librespot ottiene da sé i token che gli servono. Una sessione aperta dovrebbe quindi durare oltre l'ora del token, ma non è stato provato (serve Premium). `fresh_token` va chiamata a ogni nuova sessione.
+- `--proxy` di `play` è un vero proxy HTTP per la sessione di librespot (nascosto perché oggi lo usano solo i test).
+- Playlist: oggi `parse_request` le rifiuta con `PlayerError::PlaylistNotYet`; quando arriveranno via Web API, basterà un `PlayRequest::Playlist` espanso come gli album. Lo scope `playlist-read-private` è già richiesto all'accesso.
+- Firme per la GUI (rinnovo, precaricamento, album) in `docs/PLAYER.md`.
+
+FASE-COMPLETA
