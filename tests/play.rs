@@ -57,10 +57,18 @@ fn play_without_a_token_asks_to_sign_in_first() {
     assert_failed_cleanly(status, &stderr, "esegui prima `spotilite login`");
 }
 
+/// An expired token is renewed with its refresh token (see `tests/refresh.rs`); without
+/// one there is nothing to renew it with.
 #[test]
-fn play_with_an_expired_token_asks_to_sign_in_again() {
+fn play_with_an_expired_token_that_cannot_be_renewed_asks_to_sign_in_again() {
     let base = scratch_dir("expired");
-    save_token(&base, 1_000_000);
+    let token = Token {
+        access_token: "at-secret".to_string(),
+        refresh_token: String::new(),
+        expires_at: 1_000_000,
+        scopes: vec!["streaming".to_string()],
+    };
+    TokenStore::new(base.join("spotilite")).save(&token).expect("save the token");
     let (status, _, stderr) = play(&base, &[TRACK]);
     assert_failed_cleanly(status, &stderr, "scaduto");
     assert!(stderr.contains("spotilite login"), "stderr must say what to do, got: {stderr}");
@@ -77,11 +85,24 @@ fn play_rejects_an_invalid_uri_before_connecting() {
 }
 
 #[test]
-fn play_explains_that_albums_are_not_supported_yet() {
+fn play_explains_that_playlists_will_come_later() {
+    let base = scratch_dir("playlist");
+    save_token(&base, auth::unix_now() + 3600);
+    let (status, stdout, stderr) = play(&base, &["spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"]);
+    assert_failed_cleanly(status, &stderr, "è una playlist: le playlist arriveranno");
+    assert!(!stdout.contains("Collegamento"), "nothing must be contacted, stdout: {stdout}");
+}
+
+/// The album passes the check: the error is about the URI after it. Reading the album
+/// needs a Spotify session, so it is not tested here.
+#[test]
+fn play_accepts_an_album() {
     let base = scratch_dir("album");
     save_token(&base, auth::unix_now() + 3600);
-    let (status, _, stderr) = play(&base, &["spotify:album:6akEvsycLGftJxYudPjmqK"]);
-    assert_failed_cleanly(status, &stderr, "è un album");
+    let (status, stdout, stderr) = play(&base, &["spotify:album:6akEvsycLGftJxYudPjmqK", "spotify:track:xxx"]);
+    assert_failed_cleanly(status, &stderr, "indirizzo Spotify non valido: spotify:track:xxx");
+    assert!(!stderr.contains("6akEvsycLGftJxYudPjmqK"), "the album must be accepted, stderr: {stderr}");
+    assert!(!stdout.contains("Collegamento"), "nothing must be contacted, stdout: {stdout}");
 }
 
 #[test]

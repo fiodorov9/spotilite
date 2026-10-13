@@ -92,6 +92,18 @@ fn token_store_load_reports_a_damaged_file() {
 }
 
 #[test]
+fn a_token_expires_within_the_margin_once_the_margin_reaches_its_expiry() {
+    let token = sample_token();
+    let expiry = token.expires_at;
+
+    assert!(!token.expires_within(expiry - 301, 300), "valid for longer than the margin");
+    assert!(token.expires_within(expiry - 300, 300), "expires exactly at the end of the margin");
+    assert!(token.expires_within(expiry + 10, 300), "already expired");
+    assert!(!token.expires_within(expiry - 1, 0), "no margin: still valid for a second");
+    assert!(token.expires_within(u64::MAX, u64::MAX), "no overflow");
+}
+
+#[test]
 fn authorize_url_has_the_pkce_parameters_and_the_scopes() {
     let url = auth::authorize_url("client-abc", "http://127.0.0.1:5588/login", "challenge-xyz", "state-s1");
 

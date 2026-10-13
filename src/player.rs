@@ -18,12 +18,14 @@ use librespot::playback::config::{Bitrate, PlayerConfig};
 use librespot::playback::mixer::softmixer::SoftMixer;
 use librespot::playback::mixer::{Mixer, MixerConfig};
 use librespot::playback::player::{Player as Engine, PlayerEvent as EngineEvent, PlayerEventChannel};
+use reqwest::Url;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::audio::{AudioError, AudioOutput};
 use crate::auth::{self, Token};
-use crate::state::{DEFAULT_VOLUME, MAX_VOLUME, PlaybackEffect};
+use crate::library;
+use crate::state::{DEFAULT_VOLUME, MAX_VOLUME, PlaybackEffect, PlaybackState, Status};
 
 /// How long librespot's player thread may take to open the audio device.
 const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -38,12 +40,37 @@ pub enum PlayerError {
     Connect(String),
     #[error(transparent)]
     Audio(#[from] AudioError),
-    #[error("indirizzo Spotify non valido: {0} (atteso spotify:track:<id di 22 caratteri>)")]
+    #[error(
+        "indirizzo Spotify non valido: {0} (atteso spotify:track:, spotify:episode: o spotify:album: \
+         seguito da un id di 22 caratteri)"
+    )]
     InvalidUri(String),
-    #[error("{uri} è {kind}: per ora si possono riprodurre solo brani (spotify:track:...) ed episodi (spotify:episode:...)")]
+    #[error(
+        "{uri} è {kind}: si possono riprodurre brani (spotify:track:...), episodi (spotify:episode:...) \
+         e album (spotify:album:...)"
+    )]
     NotPlayable { uri: String, kind: &'static str },
+    #[error(
+        "{0} è una playlist: le playlist arriveranno in una prossima versione; per ora si possono \
+         riprodurre brani, episodi e album"
+    )]
+    PlaylistNotYet(String),
+    #[error("{0} è un album: il player carica un brano alla volta, dall'elenco dei brani dell'album")]
+    AlbumNotLoadable(String),
+    #[error("impossibile leggere l'album {uri}: {reason}")]
+    Album { uri: String, reason: String },
     #[error("errore interno del player: {0}")]
     Internal(String),
+}
+
+/// What `spotilite play` can do with a URI, recognised without the network. The URIs
+/// are in canonical form, as librespot reports them in the events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayRequest {
+    /// A track or an episode, ready for [`Player::load`].
+    Item(String),
+    /// An album, to turn into its tracks with [`Player::album_tracks`].
+    Album(String),
 }
 
 /// What librespot reports about playback, in spotilite's terms.
@@ -60,6 +87,9 @@ pub enum PlaybackEvent {
     },
     Playing { uri: String, position: Duration },
     Paused { uri: String, position: Duration },
+    /// The track ends in about 30 seconds and has been fully downloaded: time to preload
+    /// the next one, chosen by [`track_to_preload`].
+    TimeToPreload { uri: String },
     /// The track has ended: time for `PlaybackState::next()`.
     EndOfTrack { uri: String },
     /// Spotify cannot play this track (not available in the country, removed, ...).
@@ -81,15 +111,33 @@ impl Player {
     /// default audio device. The device is checked before going to the network, so a
     /// computer without one fails fast, with an error and not a panic.
     pub async fn connect(token: &Token) -> Result<Self, PlayerError> {
+        Self::connect_via(token, None).await
+    }
+
+    /// Like [`Player::connect`], with the Spotify session going through `proxy`, the
+    /// address of an HTTP proxy, when there is one.
+    pub async fn connect_via(token: &Token, proxy: Option<&str>) -> Result<Self, PlayerError> {
         if token.is_expired_at(auth::unix_now()) {
             return Err(PlayerError::TokenExpired);
         }
+        let proxy = proxy
+            .map(|proxy| {
+                Url::parse(proxy)
+                    .map_err(|err| PlayerError::Connect(format!("indirizzo del proxy non valido ({proxy}): {err}")))
+            })
+            .transpose()?;
         // Listing the devices may block, so it runs off the async threads.
         let output = tokio::task::spawn_blocking(AudioOutput::system_default)
             .await
             .map_err(internal)??;
 
-        let session = Session::new(SessionConfig::default(), None);
+        let session = Session::new(
+            SessionConfig {
+                proxy,
+                ..SessionConfig::default()
+            },
+            None,
+        );
         session
             .connect(Credentials::with_access_token(token.access_token.as_str()), false)
             .await
@@ -148,12 +196,35 @@ impl Player {
         self.session.username()
     }
 
+    /// The tracks of an album in listening order (disc by disc), read from Spotify's
+    /// metadata, ready to be queued one by one.
+    pub async fn album_tracks(&self, uri: &str) -> Result<Vec<String>, PlayerError> {
+        let album_error = |reason: String| PlayerError::Album {
+            uri: uri.to_string(),
+            reason,
+        };
+        let parsed = parse_uri(uri)?;
+        if !matches!(parsed, SpotifyUri::Album { .. }) {
+            return Err(album_error("non è un album".to_string()));
+        }
+        library::album_tracks(&self.session, &parsed)
+            .await
+            .map_err(|err| album_error(err.to_string()))
+    }
+
     /// Loads a track or an episode and plays it from the beginning.
     pub fn load(&self, uri: &str) -> Result<(), PlayerError> {
         let uri = parse_playable(uri)?;
         self.shared.loads.fetch_add(1, Ordering::AcqRel);
         *self.shared.clock() = Clock::default();
         self.engine.load(uri, true, 0);
+        Ok(())
+    }
+
+    /// Downloads a track or an episode ahead of time, so that a later [`Player::load`] of
+    /// the same URI starts at once. Does nothing if it is already loaded or preloading.
+    pub fn preload(&self, uri: &str) -> Result<(), PlayerError> {
+        self.engine.preload(parse_playable(uri)?);
         Ok(())
     }
 
@@ -210,21 +281,70 @@ pub fn check_uri(uri: &str) -> Result<(), PlayerError> {
     parse_playable(uri).map(drop)
 }
 
+/// The track to hand to [`Player::preload`] after `event`: when librespot announces that
+/// the current track of `state` is about to end, the next one in its queue. `None` for
+/// any other event, for an announcement about another track, when playback is stopped
+/// and on the last track of the queue.
+pub fn track_to_preload<'a>(event: &PlaybackEvent, state: &'a PlaybackState) -> Option<&'a str> {
+    let PlaybackEvent::TimeToPreload { uri } = event else {
+        return None;
+    };
+    let ending_is_current = state.current().is_some_and(|current| same_item(current, uri));
+    if state.status() == Status::Stopped || !ending_is_current {
+        return None;
+    }
+    state.queue().get(state.current_index()? + 1).map(String::as_str)
+}
+
+/// Whether two URIs name the same Spotify item: librespot reports them in their
+/// canonical form, which may be spelled differently from the one in the queue.
+fn same_item(a: &str, b: &str) -> bool {
+    a == b
+        || matches!(
+            (SpotifyUri::from_uri(a.trim()), SpotifyUri::from_uri(b.trim())),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// Recognises what `spotilite play` can do with `uri`, without the network: tracks and
+/// episodes play as they are, albums are expanded into their tracks first.
+pub fn parse_request(uri: &str) -> Result<PlayRequest, PlayerError> {
+    let parsed = parse_uri(uri)?;
+    match parsed {
+        SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => Ok(PlayRequest::Item(parsed.to_string())),
+        SpotifyUri::Album { .. } => Ok(PlayRequest::Album(parsed.to_string())),
+        _ => Err(not_playable(uri, &parsed)),
+    }
+}
+
+/// A track or an episode, for [`Player::load`] and [`Player::preload`].
 fn parse_playable(uri: &str) -> Result<SpotifyUri, PlayerError> {
-    let parsed = SpotifyUri::from_uri(uri.trim()).map_err(|_| PlayerError::InvalidUri(uri.to_string()))?;
+    let parsed = parse_uri(uri)?;
+    match parsed {
+        SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => Ok(parsed),
+        _ => Err(not_playable(uri, &parsed)),
+    }
+}
+
+fn parse_uri(uri: &str) -> Result<SpotifyUri, PlayerError> {
+    SpotifyUri::from_uri(uri.trim()).map_err(|_| PlayerError::InvalidUri(uri.to_string()))
+}
+
+/// Why `uri`, which names `parsed`, cannot be loaded as it is. Tracks and episodes never
+/// get here.
+fn not_playable(uri: &str, parsed: &SpotifyUri) -> PlayerError {
     let kind = match parsed {
-        SpotifyUri::Track { .. } | SpotifyUri::Episode { .. } => return Ok(parsed),
-        SpotifyUri::Album { .. } => "un album",
+        SpotifyUri::Album { .. } => return PlayerError::AlbumNotLoadable(uri.to_string()),
+        SpotifyUri::Playlist { .. } => return PlayerError::PlaylistNotYet(uri.to_string()),
         SpotifyUri::Artist { .. } => "un artista",
-        SpotifyUri::Playlist { .. } => "una playlist",
         SpotifyUri::Show { .. } => "un podcast",
         SpotifyUri::Local { .. } => "un file locale",
-        SpotifyUri::Unknown { .. } => "un elemento di tipo sconosciuto",
+        _ => "un elemento di tipo sconosciuto",
     };
-    Err(PlayerError::NotPlayable {
+    PlayerError::NotPlayable {
         uri: uri.to_string(),
         kind,
-    })
+    }
 }
 
 /// librespot's mixers take a volume from 0 to 65535.
@@ -360,6 +480,9 @@ fn translate(event: EngineEvent) -> Option<PlaybackEvent> {
             uri: track_id.to_string(),
             position: millis(position_ms),
         },
+        EngineEvent::TimeToPreloadNextTrack { track_id, .. } => PlaybackEvent::TimeToPreload {
+            uri: track_id.to_string(),
+        },
         EngineEvent::EndOfTrack { track_id, .. } => PlaybackEvent::EndOfTrack {
             uri: track_id.to_string(),
         },
@@ -424,11 +547,39 @@ mod tests {
 
     #[test]
     fn other_uris_are_refused_with_a_reason() {
-        let album = check_uri("spotify:album:6akEvsycLGftJxYudPjmqK").unwrap_err();
-        assert!(matches!(album, PlayerError::NotPlayable { kind: "un album", .. }), "{album:?}");
+        let album = check_uri(ALBUM).unwrap_err();
+        assert!(matches!(album, PlayerError::AlbumNotLoadable(_)), "the player loads tracks: {album:?}");
+        let artist = check_uri("spotify:artist:0gxyHStUsqpMadRV0Di1Qt").unwrap_err();
+        assert!(matches!(artist, PlayerError::NotPlayable { kind: "un artista", .. }), "{artist:?}");
         for invalid in ["spotify:track:xxx", "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC", ""] {
             assert!(matches!(check_uri(invalid), Err(PlayerError::InvalidUri(_))), "{invalid}");
         }
+    }
+
+    const ALBUM: &str = "spotify:album:6akEvsycLGftJxYudPjmqK";
+
+    #[test]
+    fn play_accepts_tracks_episodes_and_albums_in_canonical_form() {
+        assert_eq!(parse_request(TRACK).unwrap(), PlayRequest::Item(TRACK.to_string()));
+        assert_eq!(parse_request(&format!(" {LAST} ")).unwrap(), PlayRequest::Item(LAST.to_string()));
+        assert_eq!(parse_request(ALBUM).unwrap(), PlayRequest::Album(ALBUM.to_string()));
+        assert_eq!(
+            parse_request("spotify:user:someone:track:4uLU6hMCjMI75M1A2tKUQC").unwrap(),
+            PlayRequest::Item(TRACK.to_string())
+        );
+    }
+
+    #[test]
+    fn playlists_are_refused_until_they_arrive() {
+        let playlist = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M";
+        let err = parse_request(playlist).unwrap_err();
+        assert!(matches!(err, PlayerError::PlaylistNotYet(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("è una playlist") && message.contains("arriveranno"), "{message}");
+
+        let show = parse_request("spotify:show:5CfCWKI5pZ28U0uOzXkDHe").unwrap_err();
+        assert!(matches!(show, PlayerError::NotPlayable { kind: "un podcast", .. }), "{show:?}");
+        assert!(matches!(parse_request("spotify:album:xxx"), Err(PlayerError::InvalidUri(_))));
     }
 
     #[test]
@@ -494,6 +645,87 @@ mod tests {
         // Events without a request id pass when no load is pending.
         assert!(filter.is_current(&EngineEvent::VolumeChanged { volume: 1 }, 2));
         assert!(!filter.is_current(&EngineEvent::VolumeChanged { volume: 1 }, 3));
+    }
+
+    const NEXT: &str = "spotify:track:6rqhFgbbKwnb9MLmUQDhG6";
+    const LAST: &str = "spotify:episode:512ojhOuo1ktJprKbVcKyQ";
+
+    fn about_to_end(play_request_id: u64, uri: &str) -> EngineEvent {
+        EngineEvent::TimeToPreloadNextTrack {
+            play_request_id,
+            track_id: SpotifyUri::from_uri(uri).unwrap(),
+        }
+    }
+
+    fn time_to_preload(uri: &str) -> PlaybackEvent {
+        PlaybackEvent::TimeToPreload { uri: uri.to_string() }
+    }
+
+    /// Three items in the queue, the first one playing.
+    fn queue_of_three() -> PlaybackState {
+        let mut state = PlaybackState::new();
+        for uri in [TRACK, NEXT, LAST] {
+            state.enqueue(uri).unwrap();
+        }
+        state
+    }
+
+    #[test]
+    fn librespot_announcing_the_end_of_the_track_leads_to_preloading_the_next_one() {
+        let state = queue_of_three();
+        let mut filter = RequestFilter::default();
+        assert!(!filter.is_current(&EngineEvent::PlayRequestIdChanged { play_request_id: 0 }, 1));
+
+        let announcement = about_to_end(0, TRACK);
+        assert!(filter.is_current(&announcement, 1), "the announcement of the current load must pass");
+        let event = translate(announcement).expect("the announcement must reach the event loop");
+        assert_eq!(event, time_to_preload(TRACK));
+        assert_eq!(track_to_preload(&event, &state), Some(NEXT));
+    }
+
+    #[test]
+    fn an_announcement_about_an_older_load_is_dropped() {
+        let mut filter = RequestFilter::default();
+        assert!(!filter.is_current(&EngineEvent::PlayRequestIdChanged { play_request_id: 0 }, 1));
+        // A second load has been sent: the first track is no longer the one about to end.
+        assert!(!filter.is_current(&about_to_end(0, TRACK), 2));
+    }
+
+    #[test]
+    fn the_track_after_the_current_one_is_preloaded() {
+        let mut state = queue_of_three();
+        assert_eq!(track_to_preload(&time_to_preload(TRACK), &state), Some(NEXT));
+
+        state.pause().unwrap();
+        assert_eq!(track_to_preload(&time_to_preload(TRACK), &state), Some(NEXT), "paused");
+
+        state.next().unwrap();
+        assert_eq!(track_to_preload(&time_to_preload(NEXT), &state), Some(LAST));
+        assert_eq!(track_to_preload(&time_to_preload(TRACK), &state), None, "no longer the current track");
+
+        state.next().unwrap();
+        assert_eq!(track_to_preload(&time_to_preload(LAST), &state), None, "the last track has no next");
+    }
+
+    #[test]
+    fn nothing_is_preloaded_when_stopped_or_for_other_events() {
+        let mut state = queue_of_three();
+        let end = PlaybackEvent::EndOfTrack { uri: TRACK.to_string() };
+        assert_eq!(track_to_preload(&end, &state), None);
+
+        state.stop().unwrap();
+        assert_eq!(track_to_preload(&time_to_preload(TRACK), &state), None);
+        assert_eq!(track_to_preload(&time_to_preload(TRACK), &PlaybackState::new()), None, "empty queue");
+    }
+
+    #[test]
+    fn the_current_track_is_recognised_whatever_its_spelling() {
+        let mut state = PlaybackState::new();
+        state.enqueue("spotify:user:someone:track:4uLU6hMCjMI75M1A2tKUQC").unwrap();
+        state.enqueue(NEXT).unwrap();
+
+        // librespot reports the canonical form.
+        assert_eq!(track_to_preload(&time_to_preload(TRACK), &state), Some(NEXT));
     }
 
     #[test]

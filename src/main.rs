@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use spotilite::auth::{self, AuthError, PendingLogin, TokenStore};
 use spotilite::config;
-use spotilite::player::{self, PlaybackEvent, Player};
+use spotilite::player::{self, PlayRequest, PlaybackEvent, Player};
 use spotilite::state::{self, PlaybackState, Status};
 
 /// Local port that receives the redirect from Spotify after sign-in.
@@ -26,7 +26,7 @@ struct Cli {
 enum Command {
     /// Sign in with a Spotify Premium account
     Login(LoginArgs),
-    /// Play Spotify tracks or episodes, in order
+    /// Play Spotify tracks, episodes or whole albums, in order
     Play(PlayArgs),
     /// Open the graphical interface
     Gui,
@@ -58,13 +58,23 @@ struct LoginArgs {
 
 #[derive(Args)]
 struct PlayArgs {
-    /// Spotify URIs of tracks or episodes, such as spotify:track:4uLU6hMCjMI75M1A2tKUQC
+    /// Spotify URIs of tracks, episodes or albums, such as spotify:track:4uLU6hMCjMI75M1A2tKUQC
+    /// or spotify:album:6akEvsycLGftJxYudPjmqK (playlists will come in a later version)
     #[arg(required = true, value_name = "URI")]
     uris: Vec<String>,
     /// Volume from 0 to 100
     #[arg(long, default_value_t = state::DEFAULT_VOLUME,
           value_parser = clap::value_parser!(u8).range(0..=i64::from(state::MAX_VOLUME)))]
     volume: u8,
+    /// OAuth client ID used at sign-in, needed to renew the token [default: the one librespot uses]
+    #[arg(long)]
+    client_id: Option<String>,
+    /// Token endpoint, replaced by the tests with a local fake
+    #[arg(long, hide = true, default_value = auth::TOKEN_ENDPOINT)]
+    token_endpoint: String,
+    /// HTTP proxy for the Spotify session, pointed by the tests at a local fake
+    #[arg(long, hide = true)]
+    proxy: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -96,9 +106,7 @@ async fn main() -> ExitCode {
 
 async fn login(args: LoginArgs) -> Result<ExitCode> {
     let store = TokenStore::new(config::state_dir()?);
-    let client_id = args
-        .client_id
-        .unwrap_or_else(|| librespot::core::SessionConfig::default().client_id);
+    let client_id = args.client_id.unwrap_or_else(default_client_id);
     let pending = PendingLogin::start(&client_id, args.port, &args.token_endpoint)?;
 
     let mut out = io::stdout();
@@ -138,7 +146,8 @@ async fn login(args: LoginArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Says whether a token is saved and when it expires, never what it contains.
+/// Says whether a token is saved and when it expires, never what it contains. It never
+/// renews the token: `play` does that when it needs one.
 fn auth_status() -> Result<ExitCode> {
     let store = TokenStore::new(config::state_dir()?);
     let mut out = io::stdout();
@@ -150,7 +159,12 @@ fn auth_status() -> Result<ExitCode> {
     let now = auth::unix_now();
     writeln!(out, "token salvato in {}", store.path().display())?;
     if token.is_expired_at(now) {
-        writeln!(out, "scaduto il {expiry}")?;
+        let next_step = if token.refresh_token.is_empty() {
+            "esegui `spotilite login`"
+        } else {
+            "`spotilite play` lo rinnova da sé"
+        };
+        writeln!(out, "scaduto il {expiry}: {next_step}")?;
     } else {
         writeln!(out, "scade il {expiry} (tra {} minuti)", (token.expires_at - now) / 60)?;
     }
@@ -158,25 +172,47 @@ fn auth_status() -> Result<ExitCode> {
 }
 
 /// Plays the URIs in order through the state machine, until the queue ends or Ctrl+C.
+/// An album plays all its tracks, disc by disc.
 async fn play(args: PlayArgs) -> Result<ExitCode> {
     let store = TokenStore::new(config::state_dir()?);
     let Some(token) = store.load()? else {
         bail!("nessun token salvato: esegui prima `spotilite login`");
     };
     // A typo is reported before touching the audio device or the network.
-    for uri in &args.uris {
-        player::check_uri(uri)?;
-    }
+    let requests = args
+        .uris
+        .iter()
+        .map(|uri| player::parse_request(uri))
+        .collect::<Result<Vec<_>, _>>()?;
+    let client_id = args.client_id.unwrap_or_else(default_client_id);
+    let token = auth::fresh_token(&store, token, &args.token_endpoint, &client_id).await?;
 
     let mut out = io::stdout();
     writeln!(out, "Collegamento a Spotify...")?;
     out.flush()?;
-    let mut player = Player::connect(&token).await?;
+    let mut player = Player::connect_via(&token, args.proxy.as_deref()).await?;
     writeln!(out, "Collegato come {}.", player.username())?;
+
+    // Albums are read before playback starts, so the queue follows the arguments and an
+    // album that cannot be read stops everything before the first note.
+    let mut queue = Vec::new();
+    for request in requests {
+        match request {
+            PlayRequest::Item(uri) => queue.push(uri),
+            PlayRequest::Album(uri) => {
+                let tracks = player.album_tracks(&uri).await?;
+                writeln!(out, "album accodato: {}", count_tracks(tracks.len()))?;
+                queue.extend(tracks);
+            }
+        }
+    }
+    if queue.is_empty() {
+        bail!("nessun brano da riprodurre");
+    }
 
     let mut state = PlaybackState::new();
     player.apply(&state.set_volume(args.volume)?)?;
-    for uri in &args.uris {
+    for uri in &queue {
         player.apply(&state.enqueue(uri.as_str())?)?;
     }
 
@@ -207,6 +243,12 @@ async fn play(args: PlayArgs) -> Result<ExitCode> {
                 duration,
                 ..
             }) => writeln!(out, "In riproduzione: {}", describe_track(&title, &artists, duration))?,
+            Some(event @ PlaybackEvent::TimeToPreload { .. }) => {
+                // The next track downloads while this one ends, so it starts without a gap.
+                if let Some(next) = player::track_to_preload(&event, &state) {
+                    player.preload(next)?;
+                }
+            }
             Some(PlaybackEvent::EndOfTrack { .. }) => player.apply(&state.next()?)?,
             Some(PlaybackEvent::Unavailable { uri }) => {
                 unavailable += 1;
@@ -216,11 +258,20 @@ async fn play(args: PlayArgs) -> Result<ExitCode> {
             Some(_) => {}
         }
     }
-    if unavailable == args.uris.len() {
+    if unavailable == queue.len() {
         bail!("nessuno dei brani richiesti è disponibile");
     }
     writeln!(out, "Fine della coda.")?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `1 brano`, `12 brani`.
+fn count_tracks(count: usize) -> String {
+    if count == 1 {
+        "1 brano".to_string()
+    } else {
+        format!("{count} brani")
+    }
 }
 
 /// `Title (Artist, Other artist, 3:07)`.
@@ -232,6 +283,11 @@ fn describe_track(title: &str, artists: &[String], duration: Duration) -> String
     } else {
         format!("{title} ({}, {length})", artists.join(", "))
     }
+}
+
+/// The client ID librespot signs in with, used when `--client-id` is not given.
+fn default_client_id() -> String {
+    librespot::core::SessionConfig::default().client_id
 }
 
 fn not_yet_implemented(command: &str) -> Result<ExitCode> {
@@ -268,7 +324,14 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
 mod tests {
     use std::time::Duration;
 
-    use super::{describe_track, format_utc};
+    use super::{count_tracks, describe_track, format_utc};
+
+    #[test]
+    fn count_tracks_agrees_with_the_number() {
+        assert_eq!(count_tracks(0), "0 brani");
+        assert_eq!(count_tracks(1), "1 brano");
+        assert_eq!(count_tracks(12), "12 brani");
+    }
 
     #[test]
     fn describe_track_lists_artists_and_length() {

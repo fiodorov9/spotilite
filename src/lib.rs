@@ -3,5 +3,6 @@
 pub mod audio;
 pub mod auth;
 pub mod config;
+mod library;
 pub mod player;
 pub mod state;
