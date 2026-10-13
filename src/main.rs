@@ -80,6 +80,9 @@ struct PlayArgs {
 
 #[derive(Args)]
 struct GuiArgs {
+    /// Spotify URIs of tracks, episodes or albums to queue when the window opens
+    #[arg(value_name = "URI")]
+    uris: Vec<String>,
     /// OAuth client ID used at sign-in, needed to renew the token [default: the one librespot uses]
     #[arg(long)]
     client_id: Option<String>,
@@ -304,12 +307,19 @@ fn default_client_id() -> String {
 
 /// Opens the window; the engine thread in `spotilite::ui` does the playing.
 fn gui(args: GuiArgs) -> Result<ExitCode> {
+    // As with `play`, a typo is reported before anything opens.
+    let queue = args
+        .uris
+        .iter()
+        .map(|uri| player::parse_request(uri))
+        .collect::<Result<Vec<_>, _>>()?;
     let connector = ui::engine::SpotifyConnector {
         client_id: args.client_id.unwrap_or_else(default_client_id),
         token_endpoint: auth::TOKEN_ENDPOINT.to_string(),
     };
-    ui::run(ui::GuiOptions {
+    ui::run(&ui::GuiOptions {
         connector,
+        queue,
         selftest: args.selftest,
     })?;
     Ok(ExitCode::SUCCESS)

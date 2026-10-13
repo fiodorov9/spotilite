@@ -2,7 +2,7 @@
 //! the window: the fake player records what the engine asks of it and plays back the
 //! events the test feeds it.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -33,11 +33,28 @@ pub struct FakeConnector {
 impl FakeConnector {
     /// Connects at once as `username`, to a player that `FakeControls` drives.
     pub fn connected(username: &str) -> (Self, FakeControls) {
-        let (backend, controls) = FakeBackend::new(username);
+        let (connector, mut controls) = Self::scripted(vec![Ok(username)]);
+        (connector, controls.remove(0))
+    }
+
+    /// One outcome per connection, in order: a session as this user, or a problem. The
+    /// controls are those of the sessions, in the same order.
+    pub fn scripted(outcomes: Vec<Result<&str, Problem>>) -> (Self, Vec<FakeControls>) {
+        let mut all_controls = Vec::new();
+        let outcomes = outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.map(|username| {
+                    let (backend, controls) = FakeBackend::new(username);
+                    all_controls.push(controls);
+                    backend
+                })
+            })
+            .collect();
         let connector = Self {
-            outcomes: Mutex::new(VecDeque::from([Ok(backend)])),
+            outcomes: Mutex::new(outcomes),
         };
-        (connector, controls)
+        (connector, all_controls)
     }
 }
 
@@ -58,6 +75,7 @@ pub struct FakeBackend {
     calls: Arc<Mutex<Vec<Call>>>,
     events: mpsc::UnboundedReceiver<PlaybackEvent>,
     position: Arc<Mutex<Duration>>,
+    albums: Arc<Mutex<HashMap<String, Vec<String>>>>,
     dropped: Arc<AtomicBool>,
 }
 
@@ -66,8 +84,9 @@ impl FakeBackend {
         let (sender, events) = mpsc::unbounded_channel();
         let controls = FakeControls {
             calls: Arc::default(),
-            events: sender,
+            events: Mutex::new(Some(sender)),
             position: Arc::default(),
+            albums: Arc::default(),
             dropped: Arc::default(),
         };
         let backend = Self {
@@ -75,6 +94,7 @@ impl FakeBackend {
             calls: Arc::clone(&controls.calls),
             events,
             position: Arc::clone(&controls.position),
+            albums: Arc::clone(&controls.albums),
             dropped: Arc::clone(&controls.dropped),
         };
         (backend, controls)
@@ -107,6 +127,14 @@ impl Backend for FakeBackend {
     async fn next_event(&mut self) -> Option<PlaybackEvent> {
         self.events.recv().await
     }
+
+    async fn album_tracks(&self, uri: &str) -> Result<Vec<String>, PlayerError> {
+        let tracks = self.albums.lock().expect("albums").get(uri).cloned();
+        tracks.ok_or_else(|| PlayerError::Album {
+            uri: uri.to_string(),
+            reason: "album sconosciuto al player finto".to_string(),
+        })
+    }
 }
 
 impl Drop for FakeBackend {
@@ -118,8 +146,10 @@ impl Drop for FakeBackend {
 /// The test's side of the fake player.
 pub struct FakeControls {
     calls: Arc<Mutex<Vec<Call>>>,
-    events: mpsc::UnboundedSender<PlaybackEvent>,
+    /// `None` once the session has been ended.
+    events: Mutex<Option<mpsc::UnboundedSender<PlaybackEvent>>>,
     position: Arc<Mutex<Duration>>,
+    albums: Arc<Mutex<HashMap<String, Vec<String>>>>,
     dropped: Arc<AtomicBool>,
 }
 
@@ -155,11 +185,24 @@ impl FakeControls {
 
     /// Plays an event of the player to the engine.
     pub fn emit(&self, event: PlaybackEvent) {
-        self.events.send(event).expect("the engine must be listening");
+        let events = self.events.lock().expect("events");
+        let sender = events.as_ref().expect("the session has been ended");
+        sender.send(event).expect("the engine must be listening");
+    }
+
+    /// Stops the player for good, as when librespot's thread ends.
+    pub fn end_session(&self) {
+        self.events.lock().expect("events").take();
     }
 
     pub fn set_position(&self, position: Duration) {
         *self.position.lock().expect("position") = position;
+    }
+
+    /// Makes `album` readable, with these tracks.
+    pub fn set_album(&self, album: &str, tracks: &[&str]) {
+        let tracks = tracks.iter().map(|track| track.to_string()).collect();
+        self.albums.lock().expect("albums").insert(album.to_string(), tracks);
     }
 
     /// Whether the engine has let go of the player.

@@ -107,6 +107,9 @@ pub trait Backend {
 
     /// Next event of the player; `None` once it has stopped for good.
     fn next_event(&mut self) -> impl Future<Output = Option<PlaybackEvent>>;
+
+    /// The tracks of an album in listening order.
+    fn album_tracks(&self, uri: &str) -> impl Future<Output = Result<Vec<String>, PlayerError>>;
 }
 
 impl Backend for Player {
@@ -128,6 +131,10 @@ impl Backend for Player {
 
     async fn next_event(&mut self) -> Option<PlaybackEvent> {
         Player::next_event(self).await
+    }
+
+    async fn album_tracks(&self, uri: &str) -> Result<Vec<String>, PlayerError> {
+        Player::album_tracks(self, uri).await
     }
 }
 
@@ -303,6 +310,7 @@ enum SessionEnd {
 async fn run<C: Connector>(connector: C, mut commands: mpsc::UnboundedReceiver<Command>, notifier: &Notifier) {
     let mut engine = Engine {
         state: PlaybackState::new(),
+        pending: Vec::new(),
         notifier,
     };
     loop {
@@ -340,9 +348,11 @@ async fn run<C: Connector>(connector: C, mut commands: mpsc::UnboundedReceiver<C
     }
 }
 
-/// The state machine, which outlives the sessions, and the way to the window.
+/// What outlives the sessions: the state machine and the requests that wait for a
+/// session; and the way to the window.
 struct Engine<'a> {
     state: PlaybackState,
+    pending: Vec<PlayRequest>,
     notifier: &'a Notifier,
 }
 
@@ -354,15 +364,22 @@ impl Engine<'_> {
         mut backend: B,
         commands: &mut mpsc::UnboundedReceiver<Command>,
     ) -> SessionEnd {
-        // The volume may have been chosen before the session was there.
+        // The volume may have been chosen before the session was there, and so may the
+        // tracks to play.
         self.carry_out(Ok(PlaybackEffect::SetVolume(self.state.volume())), &backend);
+        if !self.pending.is_empty() {
+            for request in std::mem::take(&mut self.pending) {
+                self.add(request, &backend).await;
+            }
+            self.notifier.send(EngineEvent::Pending(Vec::new()));
+        }
         let mut ticks = tokio::time::interval(POSITION_INTERVAL);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let end = loop {
             let playing = self.state.status() == Status::Playing;
             tokio::select! {
                 command = commands.recv() => match command {
-                    Some(command) => self.command(command, &backend),
+                    Some(command) => self.command(command, &backend).await,
                     None => break SessionEnd::Closed,
                 },
                 event = backend.next_event() => match event {
@@ -385,28 +402,62 @@ impl Engine<'_> {
     }
 
     /// A command of the window, with the session open.
-    fn command(&mut self, command: Command, backend: &impl Backend) {
+    async fn command(&mut self, command: Command, backend: &impl Backend) {
         let result = match command {
             Command::TogglePlay if self.state.status() == Status::Playing => self.state.pause(),
             Command::TogglePlay => self.state.play(),
             Command::Next => self.state.next(),
             Command::Prev => self.state.prev(),
             Command::SetVolume(volume) => self.state.set_volume(volume),
-            Command::Add(PlayRequest::Item(uri)) => self.state.enqueue(uri),
-            Command::Add(PlayRequest::Album(uri)) => {
-                let text = format!("{uri} è un album: gli album arriveranno con la coda della finestra");
-                self.notifier.send(EngineEvent::Failed(Problem::Uri(text)));
-                return;
-            }
+            Command::Add(request) => return self.add(request, backend).await,
             // The session is already open.
             Command::Reconnect => return,
         };
         self.carry_out(result, backend);
     }
 
-    /// A command of the window without a session: only the volume can wait for it.
+    /// Queues a track, or every track of an album in listening order, as `spotilite
+    /// play` does; when nothing plays, the first one starts.
+    async fn add(&mut self, request: PlayRequest, backend: &impl Backend) {
+        let uri = match request {
+            PlayRequest::Item(uri) => {
+                let result = self.state.enqueue(uri);
+                return self.carry_out(result, backend);
+            }
+            PlayRequest::Album(uri) => uri,
+        };
+        let tracks = match backend.album_tracks(&uri).await {
+            Ok(tracks) if tracks.is_empty() => {
+                let text = format!("l'album {uri} non ha brani da ascoltare");
+                return self.notifier.send(EngineEvent::Failed(Problem::Other(text)));
+            }
+            Ok(tracks) => tracks,
+            Err(err) => return self.notifier.send(EngineEvent::Failed(player_problem(err))),
+        };
+        let count = tracks.len();
+        for track in tracks {
+            // Only the first track of a stopped queue asks the player for something.
+            let applied = self
+                .state
+                .enqueue(track)
+                .map_err(|err| Problem::Other(err.to_string()))
+                .and_then(|effect| backend.apply(&effect).map_err(player_problem));
+            if let Err(problem) = applied {
+                self.notifier.send(EngineEvent::Failed(problem));
+            }
+        }
+        self.notifier.send(EngineEvent::State(self.state.clone()));
+        self.notifier.send(EngineEvent::AlbumQueued { uri, tracks: count });
+    }
+
+    /// A command of the window without a session: tracks and albums wait for it, and so
+    /// does the volume; the rest cannot be done.
     fn offline(&mut self, command: Command) {
         match command {
+            Command::Add(request) => {
+                self.pending.push(request);
+                self.notifier.send(EngineEvent::Pending(self.pending.clone()));
+            }
             Command::SetVolume(volume) => {
                 if self.state.set_volume(volume).is_ok() {
                     self.notifier.send(EngineEvent::State(self.state.clone()));
@@ -414,9 +465,11 @@ impl Engine<'_> {
             }
             // Asking again while connecting changes nothing.
             Command::Reconnect => {}
-            _ => self.notifier.send(EngineEvent::Failed(Problem::Other(
-                "Spotify non è collegato: comando non eseguito".to_string(),
-            ))),
+            Command::TogglePlay | Command::Next | Command::Prev => {
+                self.notifier.send(EngineEvent::Failed(Problem::Other(
+                    "Spotify non è collegato: comando non eseguito".to_string(),
+                )));
+            }
         }
     }
 
@@ -604,5 +657,145 @@ mod tests {
         let (engine, controls, _view) = connected();
         assert!(engine.shutdown(Duration::from_secs(5)), "the engine thread must end");
         assert!(controls.dropped(), "the player must be dropped, which stops it");
+    }
+
+    const ALBUM: &str = "spotify:album:6akEvsycLGftJxYudPjmqK";
+
+    fn album_request() -> Command {
+        Command::Add(PlayRequest::Album(ALBUM.to_string()))
+    }
+
+    #[test]
+    fn an_album_is_queued_track_by_track() {
+        let (engine, controls, mut view) = connected();
+        controls.set_album(ALBUM, &[B, C]);
+        engine.send(album_request());
+        pump_until(&engine, &mut view, "the album", |view| view.notice().is_some());
+        assert_eq!(view.notice().expect("a notice").text, "Album accodato: 2 brani");
+        assert_eq!(view.queue_len(), 2);
+        assert_eq!(title(&view).as_deref(), Some(B));
+        assert_eq!(controls.playback_calls(), [start(B)], "only the first track is loaded");
+    }
+
+    #[test]
+    fn an_album_that_cannot_be_read_is_reported() {
+        let (engine, controls, mut view) = connected();
+        engine.send(album_request());
+        pump_until(&engine, &mut view, "the failure", |view| view.notice().is_some());
+        let text = &view.notice().expect("a notice").text;
+        assert!(text.starts_with("Impossibile leggere l'album") && text.contains(ALBUM), "{text}");
+        assert_eq!(view.queue_len(), 0);
+        assert!(controls.playback_calls().is_empty());
+    }
+
+    #[test]
+    fn requests_made_without_a_session_wait_for_it() {
+        let (connector, controls) = FakeConnector::scripted(vec![Err(Problem::NotSignedIn), Ok("mario")]);
+        let controls = &controls[0];
+        controls.set_album(ALBUM, &[B, C]);
+        let engine = EngineHandle::spawn(connector, || {}).expect("the engine must start");
+        let mut view = ViewModel::new();
+        pump_until(&engine, &mut view, "the sign-in problem", ViewModel::needs_login);
+
+        engine.send(view.submit_uri(A).expect("a valid URI"));
+        engine.send(album_request());
+        pump_until(&engine, &mut view, "the pending rows", |view| view.queue_len() == 2);
+        assert!(view.queue_rows().iter().all(|row| row.pending));
+
+        engine.send(Command::TogglePlay);
+        pump_until(&engine, &mut view, "the refusal", |view| view.notice().is_some());
+        let refusal = &view.notice().expect("a notice").text;
+        assert!(refusal.contains("Spotify non è collegato"), "{refusal}");
+
+        // After `spotilite login`, the user presses «Riprova».
+        engine.send(Command::Reconnect);
+        pump_until(&engine, &mut view, "the queue", |view| {
+            view.queue_len() == 3 && view.queue_rows().iter().all(|row| !row.pending)
+        });
+        assert!(!view.is_offline() && !view.needs_login());
+        assert_eq!(title(&view).as_deref(), Some(A));
+        let labels: Vec<_> = view.queue_rows().into_iter().map(|row| row.label).collect();
+        assert_eq!(labels, [A, B, C], "the requests keep their order, the album its tracks");
+        assert_eq!(controls.playback_calls(), [start(A)]);
+    }
+
+    #[test]
+    fn a_lost_session_stops_playback_and_can_be_opened_again() {
+        let (connector, controls) = FakeConnector::scripted(vec![Ok("mario"), Ok("luigi")]);
+        let engine = EngineHandle::spawn(connector, || {}).expect("the engine must start");
+        let mut view = ViewModel::new();
+        pump_until(&engine, &mut view, "the first session", |view| {
+            view.connection_label().contains("mario")
+        });
+        queue(&engine, &mut view, &[A]);
+
+        controls[0].end_session();
+        pump_until(&engine, &mut view, "the lost session", ViewModel::is_offline);
+        pump_until(&engine, &mut view, "the stop", |view| view.status() == Status::Stopped);
+        assert!(view.connection_label().contains("si è fermato"), "{}", view.connection_label());
+        assert!(controls[0].dropped());
+
+        engine.send(Command::Reconnect);
+        pump_until(&engine, &mut view, "the second session", |view| {
+            view.connection_label().contains("luigi")
+        });
+        engine.send(Command::TogglePlay);
+        controls[1].wait_for(&start(A));
+    }
+
+    #[test]
+    fn a_missing_audio_device_is_shown_without_asking_to_sign_in() {
+        let problem = Problem::Audio("nessun dispositivo audio di uscita".to_string());
+        let (connector, _) = FakeConnector::scripted(vec![Err(problem)]);
+        let engine = EngineHandle::spawn(connector, || {}).expect("the engine must start");
+        let mut view = ViewModel::new();
+        pump_until(&engine, &mut view, "the problem", ViewModel::is_offline);
+        assert!(!view.needs_login());
+        assert_eq!(
+            view.connection_label(),
+            "Problema con l'audio: nessun dispositivo audio di uscita"
+        );
+    }
+
+    #[test]
+    fn errors_are_sorted_by_what_the_user_can_do() {
+        let corrupt = serde_json::from_str::<u8>("x").expect_err("not a number");
+        let io = std::io::Error::other("disco pieno");
+        let sign_in = [
+            auth_problem(AuthError::SessionExpired),
+            auth_problem(AuthError::NotRenewable),
+            auth_problem(AuthError::RefreshRefused("invalid_client".to_string())),
+            auth_problem(AuthError::Corrupt {
+                path: "token.json".into(),
+                source: corrupt,
+            }),
+            player_problem(PlayerError::TokenExpired),
+            player_problem(PlayerError::Rejected("Bad credentials".to_string())),
+        ];
+        for problem in sign_in {
+            assert!(matches!(problem, Problem::SignIn(_)), "{problem:?}");
+        }
+        assert!(matches!(
+            auth_problem(AuthError::RefreshNetwork("timeout".to_string())),
+            Problem::Network(_)
+        ));
+        assert!(matches!(
+            player_problem(PlayerError::Connect("timeout".to_string())),
+            Problem::Network(_)
+        ));
+        assert_eq!(
+            player_problem(PlayerError::Audio(crate::audio::AudioError::NoDevice)),
+            Problem::Audio(crate::audio::AudioError::NoDevice.to_string())
+        );
+        assert!(matches!(
+            player_problem(PlayerError::InvalidUri("x".to_string())),
+            Problem::Uri(_)
+        ));
+        // The cause of a file error is kept: it says what went wrong.
+        let file = auth_problem(AuthError::Io {
+            path: "token.json".into(),
+            source: io,
+        });
+        assert_eq!(file, Problem::Other("impossibile accedere a token.json: disco pieno".to_string()));
     }
 }

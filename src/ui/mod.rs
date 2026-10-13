@@ -20,6 +20,7 @@ use thiserror::Error;
 
 use self::app::GuiApp;
 use self::engine::{EngineHandle, NoConnection, SpotifyConnector};
+use crate::player::PlayRequest;
 
 /// Title of the window.
 pub const TITLE: &str = "spotilite";
@@ -36,9 +37,12 @@ pub enum GuiError {
 }
 
 /// How `spotilite gui` opens the window.
+#[derive(Debug, Clone)]
 pub struct GuiOptions {
     /// How the engine opens the Spotify session.
     pub connector: SpotifyConnector,
+    /// What to queue when the window opens; it waits for the session if needed.
+    pub queue: Vec<PlayRequest>,
     /// Draw this many frames without connecting to Spotify, then close: the automatic
     /// check of `spotilite gui --selftest`.
     pub selftest: Option<u32>,
@@ -49,34 +53,30 @@ pub struct GuiOptions {
 /// OpenGL is the lighter way to draw it, but some displays only offer OpenGL 1.1 (virtual
 /// displays, some remote sessions): there the window falls back to Direct3D or Vulkan,
 /// through wgpu.
-pub fn run(options: GuiOptions) -> Result<(), GuiError> {
-    let GuiOptions { connector, selftest } = options;
-    if let Some(frames) = selftest {
+pub fn run(options: &GuiOptions) -> Result<(), GuiError> {
+    if let Some(frames) = options.selftest {
         start_selftest_watchdog(frames);
     }
-    let opengl_error = match open_window(eframe::Renderer::Glow, &connector, selftest) {
+    let opengl_error = match open_window(eframe::Renderer::Glow, options) {
         Err(err @ (eframe::Error::Glutin(_) | eframe::Error::NoGlutinConfigs(..) | eframe::Error::OpenGL(_))) => err,
         result => return result.map_err(|err| GuiError::Window(err.to_string())),
     };
-    open_window(eframe::Renderer::Wgpu, &connector, selftest)
+    open_window(eframe::Renderer::Wgpu, options)
         .map_err(|err| GuiError::Window(format!("{err} (OpenGL: {opengl_error})")))
 }
 
 /// Opens the window with `renderer` and starts the engine once the window exists.
-fn open_window(
-    renderer: eframe::Renderer,
-    connector: &SpotifyConnector,
-    selftest: Option<u32>,
-) -> Result<(), eframe::Error> {
+fn open_window(renderer: eframe::Renderer, options: &GuiOptions) -> Result<(), eframe::Error> {
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(TITLE)
             .with_app_id(TITLE)
             // Small enough for a 640x480 screen with its taskbar.
-            .with_inner_size([420.0, 400.0])
+            .with_inner_size([420.0, 360.0])
             .with_min_inner_size([320.0, 280.0])
             // The system's default icon rather than egui's.
             .with_icon(egui::IconData::default()),
+        centered: true,
         renderer,
         wgpu_options: eframe::WgpuConfiguration {
             wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(wgpu_setup()),
@@ -84,7 +84,11 @@ fn open_window(
         },
         ..eframe::NativeOptions::default()
     };
-    let connector = connector.clone();
+    let GuiOptions {
+        connector,
+        queue,
+        selftest,
+    } = options.clone();
     eframe::run_native(
         TITLE,
         native,
@@ -96,7 +100,7 @@ fn open_window(
                 Some(_) => EngineHandle::spawn(NoConnection, wake)?,
                 None => EngineHandle::spawn(connector, wake)?,
             };
-            Ok(Box::new(GuiApp::new(engine, selftest)))
+            Ok(Box::new(GuiApp::new(engine, queue, selftest)))
         }),
     )
 }

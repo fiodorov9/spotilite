@@ -277,6 +277,11 @@ impl ViewModel {
         (0..self.queue_len()).filter_map(|index| self.queue_row(index)).collect()
     }
 
+    /// Row of the current track in [`ViewModel::queue_rows`], the highlighted one.
+    pub fn current_row(&self) -> Option<usize> {
+        self.state.current_index()
+    }
+
     /// Rows of [`ViewModel::queue_rows`], pending requests included.
     pub fn queue_len(&self) -> usize {
         self.state.queue().len() + self.pending.len()
