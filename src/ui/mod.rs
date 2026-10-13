@@ -6,9 +6,12 @@
 
 mod app;
 pub mod engine;
+#[cfg(test)]
+mod fake;
 pub mod viewmodel;
 
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{process, thread};
 
@@ -100,11 +103,18 @@ fn open_window(
 
 /// How wgpu picks the graphics card and the API, when OpenGL cannot be used.
 fn wgpu_setup() -> eframe::egui_wgpu::WgpuSetupCreateNew {
-    use eframe::wgpu::{Backends, PowerPreference};
+    use eframe::wgpu::{Backends, DeviceDescriptor, MemoryHints, PowerPreference};
 
     let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     // A music player has no use for the most powerful GPU of a laptop.
     setup.power_preference = PowerPreference::LowPower;
+    // wgpu's default reserves GPU memory in blocks of 128 and 64 MB; with an integrated
+    // GPU that is system memory, far more than a few panels of text need.
+    let default_descriptor = Arc::clone(&setup.device_descriptor);
+    setup.device_descriptor = Arc::new(move |adapter| DeviceDescriptor {
+        memory_hints: MemoryHints::MemoryUsage,
+        ..default_descriptor(adapter)
+    });
     // Direct3D 12 is the native API on Windows. Vulkan, which wgpu would pick first, can
     // leave the window blank on a virtual display, without any error. `WGPU_BACKEND`
     // still has the last word.
