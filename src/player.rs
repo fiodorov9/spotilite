@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 
 use crate::audio::{AudioError, AudioOutput};
 use crate::auth::{self, Token};
-use crate::state::{DEFAULT_VOLUME, MAX_VOLUME, PlaybackEffect};
+use crate::state::{DEFAULT_VOLUME, MAX_VOLUME, PlaybackEffect, PlaybackState, Status};
 
 /// How long librespot's player thread may take to open the audio device.
 const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,6 +61,9 @@ pub enum PlaybackEvent {
     },
     Playing { uri: String, position: Duration },
     Paused { uri: String, position: Duration },
+    /// The track ends in about 30 seconds and has been fully downloaded: time to preload
+    /// the next one, chosen by [`track_to_preload`].
+    TimeToPreload { uri: String },
     /// The track has ended: time for `PlaybackState::next()`.
     EndOfTrack { uri: String },
     /// Spotify cannot play this track (not available in the country, removed, ...).
@@ -176,6 +179,13 @@ impl Player {
         Ok(())
     }
 
+    /// Downloads a track or an episode ahead of time, so that a later [`Player::load`] of
+    /// the same URI starts at once. Does nothing if it is already loaded or preloading.
+    pub fn preload(&self, uri: &str) -> Result<(), PlayerError> {
+        self.engine.preload(parse_playable(uri)?);
+        Ok(())
+    }
+
     pub fn play(&self) {
         self.engine.play();
     }
@@ -227,6 +237,31 @@ impl Drop for Player {
 /// Checks that `uri` names something [`Player::load`] can play, without the network.
 pub fn check_uri(uri: &str) -> Result<(), PlayerError> {
     parse_playable(uri).map(drop)
+}
+
+/// The track to hand to [`Player::preload`] after `event`: when librespot announces that
+/// the current track of `state` is about to end, the next one in its queue. `None` for
+/// any other event, for an announcement about another track, when playback is stopped
+/// and on the last track of the queue.
+pub fn track_to_preload<'a>(event: &PlaybackEvent, state: &'a PlaybackState) -> Option<&'a str> {
+    let PlaybackEvent::TimeToPreload { uri } = event else {
+        return None;
+    };
+    let ending_is_current = state.current().is_some_and(|current| same_item(current, uri));
+    if state.status() == Status::Stopped || !ending_is_current {
+        return None;
+    }
+    state.queue().get(state.current_index()? + 1).map(String::as_str)
+}
+
+/// Whether two URIs name the same Spotify item: librespot reports them in their
+/// canonical form, which may be spelled differently from the one in the queue.
+fn same_item(a: &str, b: &str) -> bool {
+    a == b
+        || matches!(
+            (SpotifyUri::from_uri(a.trim()), SpotifyUri::from_uri(b.trim())),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 fn parse_playable(uri: &str) -> Result<SpotifyUri, PlayerError> {
@@ -379,6 +414,9 @@ fn translate(event: EngineEvent) -> Option<PlaybackEvent> {
             uri: track_id.to_string(),
             position: millis(position_ms),
         },
+        EngineEvent::TimeToPreloadNextTrack { track_id, .. } => PlaybackEvent::TimeToPreload {
+            uri: track_id.to_string(),
+        },
         EngineEvent::EndOfTrack { track_id, .. } => PlaybackEvent::EndOfTrack {
             uri: track_id.to_string(),
         },
@@ -513,6 +551,87 @@ mod tests {
         // Events without a request id pass when no load is pending.
         assert!(filter.is_current(&EngineEvent::VolumeChanged { volume: 1 }, 2));
         assert!(!filter.is_current(&EngineEvent::VolumeChanged { volume: 1 }, 3));
+    }
+
+    const NEXT: &str = "spotify:track:6rqhFgbbKwnb9MLmUQDhG6";
+    const LAST: &str = "spotify:episode:512ojhOuo1ktJprKbVcKyQ";
+
+    fn about_to_end(play_request_id: u64, uri: &str) -> EngineEvent {
+        EngineEvent::TimeToPreloadNextTrack {
+            play_request_id,
+            track_id: SpotifyUri::from_uri(uri).unwrap(),
+        }
+    }
+
+    fn time_to_preload(uri: &str) -> PlaybackEvent {
+        PlaybackEvent::TimeToPreload { uri: uri.to_string() }
+    }
+
+    /// Three items in the queue, the first one playing.
+    fn queue_of_three() -> PlaybackState {
+        let mut state = PlaybackState::new();
+        for uri in [TRACK, NEXT, LAST] {
+            state.enqueue(uri).unwrap();
+        }
+        state
+    }
+
+    #[test]
+    fn librespot_announcing_the_end_of_the_track_leads_to_preloading_the_next_one() {
+        let state = queue_of_three();
+        let mut filter = RequestFilter::default();
+        assert!(!filter.is_current(&EngineEvent::PlayRequestIdChanged { play_request_id: 0 }, 1));
+
+        let announcement = about_to_end(0, TRACK);
+        assert!(filter.is_current(&announcement, 1), "the announcement of the current load must pass");
+        let event = translate(announcement).expect("the announcement must reach the event loop");
+        assert_eq!(event, time_to_preload(TRACK));
+        assert_eq!(track_to_preload(&event, &state), Some(NEXT));
+    }
+
+    #[test]
+    fn an_announcement_about_an_older_load_is_dropped() {
+        let mut filter = RequestFilter::default();
+        assert!(!filter.is_current(&EngineEvent::PlayRequestIdChanged { play_request_id: 0 }, 1));
+        // A second load has been sent: the first track is no longer the one about to end.
+        assert!(!filter.is_current(&about_to_end(0, TRACK), 2));
+    }
+
+    #[test]
+    fn the_track_after_the_current_one_is_preloaded() {
+        let mut state = queue_of_three();
+        assert_eq!(track_to_preload(&time_to_preload(TRACK), &state), Some(NEXT));
+
+        state.pause().unwrap();
+        assert_eq!(track_to_preload(&time_to_preload(TRACK), &state), Some(NEXT), "paused");
+
+        state.next().unwrap();
+        assert_eq!(track_to_preload(&time_to_preload(NEXT), &state), Some(LAST));
+        assert_eq!(track_to_preload(&time_to_preload(TRACK), &state), None, "no longer the current track");
+
+        state.next().unwrap();
+        assert_eq!(track_to_preload(&time_to_preload(LAST), &state), None, "the last track has no next");
+    }
+
+    #[test]
+    fn nothing_is_preloaded_when_stopped_or_for_other_events() {
+        let mut state = queue_of_three();
+        let end = PlaybackEvent::EndOfTrack { uri: TRACK.to_string() };
+        assert_eq!(track_to_preload(&end, &state), None);
+
+        state.stop().unwrap();
+        assert_eq!(track_to_preload(&time_to_preload(TRACK), &state), None);
+        assert_eq!(track_to_preload(&time_to_preload(TRACK), &PlaybackState::new()), None, "empty queue");
+    }
+
+    #[test]
+    fn the_current_track_is_recognised_whatever_its_spelling() {
+        let mut state = PlaybackState::new();
+        state.enqueue("spotify:user:someone:track:4uLU6hMCjMI75M1A2tKUQC").unwrap();
+        state.enqueue(NEXT).unwrap();
+
+        // librespot reports the canonical form.
+        assert_eq!(track_to_preload(&time_to_preload(TRACK), &state), Some(NEXT));
     }
 
     #[test]

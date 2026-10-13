@@ -6,8 +6,8 @@ Brief: `D:\spotilite\briefs\f3-sessione.md`. Ramo: `claude/f3`. Worktree: `D:\sp
 |------|-------|------|
 | F3-1 test del rinnovo automatico (RED) | FATTO | `cargo test --test refresh`: 3 passed, 6 failed (nessun rinnovo all'endpoint finto), exit 101 |
 | F3-2 rinnovo in `auth.rs` (GREEN) | FATTO | `cargo test`: 73 passed (refresh 9/9); clippy pulito; rinnovo con refresh token finto contro l'endpoint reale: «sessione scaduta», exit 1, file intatto |
-| F3-3 precaricamento del brano successivo | IN CORSO | |
-| F3-4 play di un album intero | DA FARE | |
+| F3-3 precaricamento del brano successivo | FATTO | `cargo test`: 78 passed (5 unit test nuovi); clippy pulito; prova reale non possibile qui |
+| F3-4 play di un album intero | IN CORSO | |
 | F3-5 verifica e rapporto | DA FARE | |
 
 ## Log
@@ -46,3 +46,13 @@ Brief: `D:\spotilite\briefs\f3-sessione.md`. Ramo: `claude/f3`. Worktree: `D:\sp
   - `play --help` mostra `--client-id` e non i flag nascosti `--token-endpoint` e `--proxy`.
 - F3-2, `docs/PLAYER.md`: nuova sezione `auth` (`fresh_token`, `refresh`, errori) e `connect_via`; titolo corretto in «GUI (F4)». `README.md`: riga sulla fase F3 e sul rinnovo automatico.
 - F3-2, il messaggio del brief è «sessione scaduta: esegui spotilite login»: come per gli altri messaggi del progetto (per esempio «esegui prima `spotilite login`», che il brief riporta anch'esso senza apici) il comando è tra apici inversi.
+- F3-2, commit `e34d035`.
+- F3-3, `src/player.rs`:
+  - nuovo evento `PlaybackEvent::TimeToPreload { uri }`, tradotto da `TimeToPreloadNextTrack` di librespot; `uri` è il brano **che sta per finire** (così lo manda librespot) e passa dallo stesso filtro degli eventi superati (`play_request_id`);
+  - `Player::preload(&self, uri)`: controllo dell'URI come `load`, poi `preload` del player di librespot. Non tocca il conteggio dei `load` né l'orologio della posizione;
+  - `track_to_preload(&event, &state) -> Option<&str>`, logica pura: per un `TimeToPreload` del brano corrente restituisce il brano seguente della coda; `None` per gli altri eventi, per un annuncio su un brano non più corrente, da fermo, sull'ultimo brano. Il confronto con il brano corrente avviene sugli URI analizzati (`SpotifyUri`), perché librespot riporta la forma canonica e la coda può contenere la stessa voce scritta diversamente (per esempio `spotify:user:<nome>:track:<id>`).
+- F3-3, ciclo di `play` (`src/main.rs`): su `TimeToPreload` chiama `player::track_to_preload` e, se c'è un brano, `player.preload(next)`. Al successivo `EndOfTrack` il ciclo fa come prima (`state.next()` -> `load` del brano seguente) e librespot, trovandolo precaricato, usa i dati già scaricati. La GUI di F4 farà lo stesso (descritto in `docs/PLAYER.md`, «Ciclo tipico»).
+- F3-3, unit test nuovi (5, senza rete): dall'evento di librespot `TimeToPreloadNextTrack` attraverso filtro e traduzione fino all'URI da passare a `preload`; annuncio di un `load` superato scartato dal filtro; scelta del brano (in riproduzione, in pausa, dopo `next`, annuncio su un brano non più corrente, ultimo brano); niente precaricamento da fermo, a coda vuota o per altri eventi; brano corrente riconosciuto anche con una grafia non canonica.
+- F3-3, **non coperto dagli unit test**: l'ultimo passo, la chiamata `preload` sul player di librespot dentro `Player::preload`. Per provarla serve un `Player` di librespot vero, cioè una `Session` e un sink audio: anche con una sessione non collegata, il precaricamento avvia lo scaricamento del brano, che va ai server di Spotify (metadati e file audio), quindi non è un test senza rete. Quello che resta fuori è una riga (`self.engine.preload(parse_playable(uri)?)`); il controllo dell'URI che la precede è lo stesso di `load`, coperto dai test.
+- F3-3, verifica: `cargo test` -> lib 16, main 2, auth 12, cli 2, login 9, play 6, refresh 9, state 22: **78 passed, 0 failed**; `cargo clippy --all-targets` exit 0, 0 warning. `docs/PLAYER.md`: `preload`, evento `TimeToPreload`, `track_to_preload`, ciclo tipico aggiornato.
+- F3-3, prova reale: non possibile da questa sessione (serve un account Premium per ascoltare un brano fino a 30 s dalla fine): va in «COMPILATO NON PROVATO».

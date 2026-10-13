@@ -222,6 +222,12 @@ async fn play(args: PlayArgs) -> Result<ExitCode> {
                 duration,
                 ..
             }) => writeln!(out, "In riproduzione: {}", describe_track(&title, &artists, duration))?,
+            Some(event @ PlaybackEvent::TimeToPreload { .. }) => {
+                // The next track downloads while this one ends, so it starts without a gap.
+                if let Some(next) = player::track_to_preload(&event, &state) {
+                    player.preload(next)?;
+                }
+            }
             Some(PlaybackEvent::EndOfTrack { .. }) => player.apply(&state.next()?)?,
             Some(PlaybackEvent::Unavailable { uri }) => {
                 unavailable += 1;
