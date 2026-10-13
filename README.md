@@ -33,6 +33,8 @@ Fase **F1** (dipendenze e accesso): `spotilite login` usa OAuth con PKCE e salva
 in `%APPDATA%\spotilite\token.json` su Windows, `~/.local/state/spotilite/token.json` su Linux.
 Fase **F2** (riproduzione): `spotilite play` suona brani ed episodi con librespot, sul dispositivo
 audio predefinito; album e playlist non sono ancora supportati.
+Fase **F3** (sessione continua): il token di accesso dura un'ora e `spotilite play` lo rinnova
+da sé quando è scaduto o sta per scadere; `spotilite login` serve solo se Spotify revoca l'accesso.
 L'interfaccia grafica arriva nella fase successiva.
 L'architettura prevista è descritta in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 

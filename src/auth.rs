@@ -36,6 +36,9 @@ pub const SCOPES: &[&str] = &[
 
 const TOKEN_FILE: &str = "token.json";
 
+/// A token that expires within this many seconds is renewed before it opens a session.
+pub const REFRESH_MARGIN_SECS: u64 = 300;
+
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("impossibile accedere a {}", .path.display())]
@@ -74,6 +77,14 @@ pub enum AuthError {
     Exchange(String),
     #[error("errore interno durante l'accesso: {0}")]
     Internal(String),
+    #[error("sessione scaduta: esegui `spotilite login`")]
+    SessionExpired,
+    #[error("il token di accesso è scaduto e non si può rinnovare: esegui `spotilite login`")]
+    NotRenewable,
+    #[error("errore di rete durante il rinnovo del token: {0}")]
+    RefreshNetwork(String),
+    #[error("Spotify ha rifiutato il rinnovo del token ({0}): esegui `spotilite login`")]
+    RefreshRefused(String),
 }
 
 /// Credentials returned by Spotify, as saved in `token.json`.
@@ -91,6 +102,11 @@ pub struct Token {
 impl Token {
     pub fn is_expired_at(&self, unix_seconds: u64) -> bool {
         unix_seconds >= self.expires_at
+    }
+
+    /// Whether the token has expired at `unix_seconds` or expires within `margin` seconds.
+    pub fn expires_within(&self, unix_seconds: u64, margin: u64) -> bool {
+        self.is_expired_at(unix_seconds.saturating_add(margin))
     }
 }
 
@@ -427,11 +443,68 @@ struct TokenResponse {
     scope: String,
 }
 
+impl TokenResponse {
+    fn into_token(self) -> Token {
+        Token {
+            access_token: self.access_token,
+            refresh_token: self.refresh_token.unwrap_or_default(),
+            expires_at: unix_now().saturating_add(self.expires_in),
+            scopes: self.scope.split_whitespace().map(str::to_string).collect(),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ErrorResponse {
     error: String,
     #[serde(default)]
     error_description: Option<String>,
+}
+
+/// How a request to the token endpoint went wrong.
+enum EndpointError {
+    Network(String),
+    /// Spotify answered with an error, or with something that is not a token.
+    Refused {
+        /// OAuth error code (RFC 6749 section 5.2), such as `invalid_grant`.
+        code: Option<String>,
+        /// Readable reason, with Spotify's description when there is one.
+        reason: String,
+    },
+}
+
+/// Posts `form` to the token endpoint and reads the token it answers with.
+async fn request_token(endpoint: &str, form: &[(&str, &str)]) -> Result<TokenResponse, EndpointError> {
+    let network_error = |err: reqwest::Error| EndpointError::Network(error_chain(&err));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(network_error)?;
+    let response = client.post(endpoint).form(form).send().await.map_err(network_error)?;
+    let status = response.status();
+    let body = response.bytes().await.map_err(network_error)?;
+    if !status.is_success() {
+        return Err(match serde_json::from_slice::<ErrorResponse>(&body) {
+            Ok(ErrorResponse {
+                error,
+                error_description,
+            }) => EndpointError::Refused {
+                reason: match error_description {
+                    Some(description) => format!("{error}: {description}"),
+                    None => error.clone(),
+                },
+                code: Some(error),
+            },
+            Err(_) => EndpointError::Refused {
+                code: None,
+                reason: format!("HTTP {status}"),
+            },
+        });
+    }
+    serde_json::from_slice(&body).map_err(|err| EndpointError::Refused {
+        code: None,
+        reason: format!("risposta non valida: {err}"),
+    })
 }
 
 /// Trades the authorization code for a token at the token endpoint (RFC 6749 section 4.1.3,
@@ -443,57 +516,67 @@ async fn exchange_code(
     redirect_uri: &str,
     verifier: &str,
 ) -> Result<Token, AuthError> {
-    let network_error = |err: reqwest::Error| AuthError::Network(error_chain(&err));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(network_error)?;
-    let response = client
-        .post(endpoint)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-            ("client_id", client_id),
-            ("code_verifier", verifier),
-        ])
-        .send()
-        .await
-        .map_err(network_error)?;
-    let status = response.status();
-    let body = response.bytes().await.map_err(network_error)?;
-    if !status.is_success() {
-        let reason = match serde_json::from_slice::<ErrorResponse>(&body) {
-            Ok(ErrorResponse {
-                error,
-                error_description: Some(description),
-            }) => format!("{error}: {description}"),
-            Ok(ErrorResponse { error, .. }) => error,
-            Err(_) => format!("HTTP {status}"),
-        };
-        return Err(AuthError::Exchange(reason));
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("client_id", client_id),
+        ("code_verifier", verifier),
+    ];
+    match request_token(endpoint, &form).await {
+        Ok(response) => Ok(response.into_token()),
+        Err(EndpointError::Network(detail)) => Err(AuthError::Network(detail)),
+        Err(EndpointError::Refused { reason, .. }) => Err(AuthError::Exchange(reason)),
     }
-    let response: TokenResponse = serde_json::from_slice(&body)
-        .map_err(|err| AuthError::Exchange(format!("risposta non valida: {err}")))?;
-    Ok(Token {
-        access_token: response.access_token,
-        refresh_token: response.refresh_token.unwrap_or_default(),
-        expires_at: unix_now().saturating_add(response.expires_in),
-        scopes: response.scope.split_whitespace().map(str::to_string).collect(),
-    })
 }
 
-/// Returns `token` ready to open a new session.
-///
-/// F3-2 renews it here at `token_endpoint` when it has expired or is about to.
+/// Returns `token` ready to open a new session: as it is while it stays valid for more
+/// than [`REFRESH_MARGIN_SECS`], otherwise renewed with [`refresh`] and saved in `store`
+/// before it is returned. A token without a refresh token is used until it expires.
 pub async fn fresh_token(
     store: &TokenStore,
     token: Token,
     token_endpoint: &str,
     client_id: &str,
 ) -> Result<Token, AuthError> {
-    let _ = (store, token_endpoint, client_id);
-    Ok(token)
+    let now = unix_now();
+    let renewable = !token.refresh_token.is_empty();
+    if !token.expires_within(now, REFRESH_MARGIN_SECS) || (!renewable && !token.is_expired_at(now)) {
+        return Ok(token);
+    }
+    let renewed = refresh(token_endpoint, client_id, &token).await?;
+    store.save(&renewed)?;
+    Ok(renewed)
+}
+
+/// Trades the refresh token for a new access token at the token endpoint (RFC 6749
+/// section 6). Spotify may send a new refresh token; if it does not, the old one stays,
+/// and so do the scopes.
+pub async fn refresh(token_endpoint: &str, client_id: &str, token: &Token) -> Result<Token, AuthError> {
+    if token.refresh_token.is_empty() {
+        return Err(AuthError::NotRenewable);
+    }
+    let form = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", token.refresh_token.as_str()),
+        ("client_id", client_id),
+    ];
+    let mut renewed = match request_token(token_endpoint, &form).await {
+        Ok(response) => response.into_token(),
+        Err(EndpointError::Network(detail)) => return Err(AuthError::RefreshNetwork(detail)),
+        // The refresh token has been revoked or has lapsed: only a new sign-in helps.
+        Err(EndpointError::Refused { code: Some(code), .. }) if code == "invalid_grant" => {
+            return Err(AuthError::SessionExpired);
+        }
+        Err(EndpointError::Refused { reason, .. }) => return Err(AuthError::RefreshRefused(reason)),
+    };
+    if renewed.refresh_token.is_empty() {
+        renewed.refresh_token.clone_from(&token.refresh_token);
+    }
+    if renewed.scopes.is_empty() {
+        renewed.scopes.clone_from(&token.scopes);
+    }
+    Ok(renewed)
 }
 
 /// Joins an error with its causes: reqwest keeps the useful detail in the sources.

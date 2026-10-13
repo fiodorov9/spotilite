@@ -145,7 +145,8 @@ async fn login(args: LoginArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Says whether a token is saved and when it expires, never what it contains.
+/// Says whether a token is saved and when it expires, never what it contains. It never
+/// renews the token: `play` does that when it needs one.
 fn auth_status() -> Result<ExitCode> {
     let store = TokenStore::new(config::state_dir()?);
     let mut out = io::stdout();
@@ -157,7 +158,12 @@ fn auth_status() -> Result<ExitCode> {
     let now = auth::unix_now();
     writeln!(out, "token salvato in {}", store.path().display())?;
     if token.is_expired_at(now) {
-        writeln!(out, "scaduto il {expiry}")?;
+        let next_step = if token.refresh_token.is_empty() {
+            "esegui `spotilite login`"
+        } else {
+            "`spotilite play` lo rinnova da sé"
+        };
+        writeln!(out, "scaduto il {expiry}: {next_step}")?;
     } else {
         writeln!(out, "scade il {expiry} (tra {} minuti)", (token.expires_at - now) / 60)?;
     }

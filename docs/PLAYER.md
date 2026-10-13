@@ -1,6 +1,6 @@
-# Riproduzione: interfaccia per la GUI (F3)
+# Riproduzione: interfaccia per la GUI (F4)
 
-Tre moduli della libreria `spotilite`; i tipi di librespot non escono da `player` e `audio`.
+Quattro moduli della libreria `spotilite`; i tipi di librespot non escono da `player` e `audio`.
 
 ## `state`: logica pura, senza rete né audio
 - `PlaybackState::new() -> PlaybackState` (anche `Default`): `Stopped`, coda vuota, volume 100.
@@ -8,8 +8,13 @@ Tre moduli della libreria `spotilite`; i tipi di librespot non escono da `player
 - Letture: `status(&self) -> Status` (`Stopped`, `Playing`, `Paused`), `queue(&self) -> &[String]`, `current(&self) -> Option<&str>`, `current_index(&self) -> Option<usize>`, `volume(&self) -> u8`.
 - `PlaybackEffect`: `None`, `StartTrack(String)`, `Resume`, `Pause`, `Stop`, `SetVolume(u8)`. `StateError`: `EmptyQueue`, `EmptyUri`.
 
+## `auth`: token fresco prima della sessione
+- `async fn auth::fresh_token(store: &TokenStore, token: Token, token_endpoint: &str, client_id: &str) -> Result<Token, AuthError>`: restituisce il token così com'è se vale ancora per più di `REFRESH_MARGIN_SECS` (300 s), altrimenti lo rinnova con il refresh token e lo salva (scrittura atomica) prima di restituirlo. `token_endpoint`: `auth::TOKEN_ENDPOINT`; `client_id`: quello usato per l'accesso (di solito quello di librespot).
+- Errori del rinnovo: `SessionExpired` («sessione scaduta: esegui `spotilite login`», refresh token revocato), `NotRenewable` (token scaduto senza refresh token), `RefreshNetwork`, `RefreshRefused`. In tutti i casi il file del token resta com'era.
+- `async fn auth::refresh(token_endpoint, client_id, token: &Token) -> Result<Token, AuthError>`: solo il rinnovo, senza salvare.
+
 ## `player`: sessione e player di librespot
-- `async fn Player::connect(token: &auth::Token) -> Result<Player, PlayerError>`: controlla la scadenza del token e il dispositivo audio, poi apre la sessione. Va chiamata dentro un runtime tokio.
+- `async fn Player::connect(token: &auth::Token) -> Result<Player, PlayerError>`: controlla la scadenza del token e il dispositivo audio, poi apre la sessione. Va chiamata dentro un runtime tokio, con il token di `auth::fresh_token`. `Player::connect_via(token, proxy: Option<&str>)` fa lo stesso passando da un proxy HTTP.
 - `load(&self, uri: &str) -> Result<(), PlayerError>`, `play(&self)`, `pause(&self)`, `stop(&self)`, `set_volume(&self, volume: u8)`, `position(&self) -> Duration`, `username(&self) -> String`.
 - `apply(&self, effect: &PlaybackEffect) -> Result<(), PlayerError>`: esegue l'esito della macchina a stati.
 - `async fn next_event(&mut self) -> Option<PlaybackEvent>`: `Loading`, `TrackInfo { title, artists, duration }`, `Playing { position }`, `Paused { position }`, `EndOfTrack`, `Unavailable`, `Stopped`, tutti con `uri`. `None`: il player di librespot si è fermato.
